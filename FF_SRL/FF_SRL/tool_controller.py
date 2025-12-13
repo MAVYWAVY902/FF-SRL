@@ -199,18 +199,19 @@ class ToolController:
     def toggle_grasp(self):
         """Toggle grasping on/off (like xpbd-tissue-sim left click)"""
         self.is_grasping = not self.is_grasping
+        print(f"Grasping: {'ON' if self.is_grasping else 'OFF'}")
         
-        if self.is_grasping:
-            # Activate clamp
-            envs = torch.tensor(
-                [1] * self.sim_model.numEnvs,
-                dtype=torch.int32,
-                device=self.device
-            )
-            self.sim_model.forceLaparoscopeClamp(envs)
-        else:
-            # Release clamp (you may need to add a release method to sim_model)
-            pass
+        if not self.is_grasping:
+            # Release all vertices when grasping is turned off
+            self._release_grasp()
+    
+    def _release_grasp(self):
+        """Release all grasped vertices"""
+        # Set all drag constraints to 0
+        if hasattr(self.sim_model, 'activeDragConstraint'):
+            import warp as wp
+            zeros = wp.zeros_like(self.sim_model.activeDragConstraint)
+            wp.copy(zeros, self.sim_model.activeDragConstraint)
     
     def apply_actions(self, num_envs: int = 1):
         """
@@ -219,6 +220,15 @@ class ToolController:
         Args:
             num_envs: Number of environments
         """
+        # If grasping is active, trigger clamp check every frame
+        if self.is_grasping:
+            envs = torch.tensor(
+                [1] * self.sim_model.numEnvs,
+                dtype=torch.int32,
+                device=self.device
+            )
+            self.sim_model.forceLaparoscopeClamp(envs)
+        
         if torch.any(self.cartesian_actions != 0.0):
             # Clamp to workspace limits if defined
             if self.params.workspace_min is not None and self.params.workspace_max is not None:

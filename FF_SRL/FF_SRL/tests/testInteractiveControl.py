@@ -126,9 +126,8 @@ class InteractiveSimulation:
         self.show_help = False
         self.control_mode = "keyboard"  # or "mouse" or "gamepad"
         
-        # CUDA graph optimization
+        # CUDA graph optimization (only for simulation, renderer has its own)
         self.sim_graph = None
-        self.render_graph = None
         
         print("Initialization complete!")
         self._print_controls()
@@ -193,7 +192,7 @@ class InteractiveSimulation:
     def toggle_grasp(self):
         """Toggle grasping"""
         self.tool_controller.toggle_grasp()
-        print(f"Grasping: {'ON' if self.tool_controller.is_grasping else 'OFF'}")
+        # Print statement is now in tool_controller.toggle_grasp()
     
     def increase_grasp_radius(self):
         """Increase grasp radius"""
@@ -273,25 +272,27 @@ class InteractiveSimulation:
         elif self.control_mode == "gamepad":
             self.tool_controller.update_from_gamepad(self.input_handler)
         
-        # Update camera from mouse (always active)
-        # Left button = orbit, Middle button = pan
-        left_pressed = self.input_handler.is_mouse_button_pressed(MouseButton.LEFT)
-        middle_pressed = self.input_handler.is_mouse_button_pressed(MouseButton.MIDDLE)
-        
+        # Update camera from mouse ONLY if mouse actually moved/scrolled
+        # (Event-driven like Easy3D, not polling every frame)
         dx, dy = self.input_handler.get_mouse_delta()
-        
-        # Only orbit if not in mouse control mode (to avoid conflicts)
-        if left_pressed and self.control_mode != "mouse":
-            self.camera_controller.handle_mouse_orbit(dx, dy, True)
-        
-        if middle_pressed:
-            self.camera_controller.handle_mouse_pan(dx, dy, True)
-        
-        # Zoom from scroll (always active unless Space held in mouse mode)
         scroll_dx, scroll_dy = self.input_handler.get_scroll_delta()
-        if abs(scroll_dy) > 0.01:
-            if not (self.control_mode == "mouse" and self.input_handler.is_key_pressed(Key.SPACE)):
-                self.camera_controller.handle_mouse_zoom(scroll_dy)
+        
+        # Only update camera if there's actual input
+        if abs(dx) > 0.01 or abs(dy) > 0.01 or abs(scroll_dy) > 0.01:
+            left_pressed = self.input_handler.is_mouse_button_pressed(MouseButton.LEFT)
+            middle_pressed = self.input_handler.is_mouse_button_pressed(MouseButton.MIDDLE)
+            
+            # Only orbit if not in mouse control mode (to avoid conflicts)
+            if left_pressed and self.control_mode != "mouse" and (abs(dx) > 0.01 or abs(dy) > 0.01):
+                self.camera_controller.handle_mouse_orbit(dx, dy, True)
+            
+            if middle_pressed and (abs(dx) > 0.01 or abs(dy) > 0.01):
+                self.camera_controller.handle_mouse_pan(dx, dy, True)
+            
+            # Zoom from scroll
+            if abs(scroll_dy) > 0.01:
+                if not (self.control_mode == "mouse" and self.input_handler.is_key_pressed(Key.SPACE)):
+                    self.camera_controller.handle_mouse_zoom(scroll_dy)
         
         # Reset input deltas
         self.input_handler.reset_deltas()
@@ -302,10 +303,13 @@ class InteractiveSimulation:
             # Apply tool actions
             self.tool_controller.apply_actions(self.num_envs)
             
-            # Physics step
+            # Physics step - use Reduce version for single environment (faster)
             if self.sim_graph is None:
                 wp.capture_begin()
-                self.sim_integrator.stepModel(self.sim_model)
+                if self.sim_model.reduce:
+                    self.sim_integrator.stepModelReduce(self.sim_model)
+                else:
+                    self.sim_integrator.stepModel(self.sim_model)
                 self.sim_graph = wp.capture_end()
             else:
                 wp.capture_launch(self.sim_graph)
@@ -314,8 +318,8 @@ class InteractiveSimulation:
         """Render frame"""
         self.sim_bvh.refitBVH(useGraph=True)
         
-        # Don't use CUDA graph for rendering - window display causes synchronization
-        # which is incompatible with graph capture
+        # renderNew() handles graph capture internally - just call it
+        # (it creates its own graph inside, we don't need to capture here)
         self.renderer.renderNew(self.sim_bvh, self.sim_model)
     
     def run(self, max_iterations=10000):
