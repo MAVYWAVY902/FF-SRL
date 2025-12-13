@@ -697,6 +697,274 @@ def neoHookeanConstraints(predictedVertex: wp.array(dtype=wp.vec3),
     wp.atomic_add(constraintsNumber, tetrahedronIndexC, 1)
     wp.atomic_add(constraintsNumber, tetrahedronIndexD, 1)
 
+
+# ============================================================================
+# Stable Neo-Hookean Constraints (Macklin 2017)
+# Based on C++ xpbd-tissue-sim implementation
+# ============================================================================
+
+@wp.kernel
+def stableNeoHookeanDeviatoric(
+    predictedVertex: wp.array(dtype=wp.vec3),
+    dP: wp.array(dtype=wp.vec3),
+    constraintsNumber: wp.array(dtype=int),
+    tetrahedron: wp.array(dtype=int),
+    inverseRestPositions: wp.array(dtype=wp.mat33),
+    lambdas: wp.array(dtype=float),
+    inverseMass: wp.array(dtype=float),
+    restVolume: wp.array(dtype=float),
+    activeTetrahedron: wp.array(dtype=float),
+    mu: float,
+    dT: float):
+    """
+    Stable Neo-Hookean Deviatoric Constraint (Macklin 2017)
+    
+    Constraint: C = ||F||_F (Frobenius norm of deformation gradient)
+    Resists shear/shape distortion while being volume-independent.
+    """
+    
+    tid = wp.tid()
+    
+    if activeTetrahedron[tid] < 0.5:
+        return
+    
+    # Get vertex indices from flat array
+    v0_idx = tetrahedron[tid * 4 + 0]
+    v1_idx = tetrahedron[tid * 4 + 1]
+    v2_idx = tetrahedron[tid * 4 + 2]
+    v3_idx = tetrahedron[tid * 4 + 3]
+    
+    # Get current positions
+    p0 = predictedVertex[v0_idx]
+    p1 = predictedVertex[v1_idx]
+    p2 = predictedVertex[v2_idx]
+    p3 = predictedVertex[v3_idx]
+    
+    # Get inverse masses
+    w0 = inverseMass[v0_idx]
+    w1 = inverseMass[v1_idx]
+    w2 = inverseMass[v2_idx]
+    w3 = inverseMass[v3_idx]
+    
+    # Get precomputed inverse rest matrix and volume
+    Q = inverseRestPositions[tid]
+    V0 = restVolume[tid]
+    
+    # USD data may have inverted tets (negative det(Q))
+    # Correct by negating Q if its determinant is negative
+    det_Q = wp.determinant(Q)
+    if det_Q < 0.0:
+        Q = -Q
+        V0 = wp.abs(V0)
+    
+    # Compute deformation gradient F = Ds * Q
+    # Ds = [p1-p0 | p2-p0 | p3-p0]
+    Ds = wp.mat33(p1 - p0, p2 - p0, p3 - p0)
+    F = Ds * Q
+    
+    # Compute constraint value: C = ||F||_F (Frobenius norm)
+    I1 = (F[0,0]*F[0,0] + F[0,1]*F[0,1] + F[0,2]*F[0,2] +
+          F[1,0]*F[1,0] + F[1,1]*F[1,1] + F[1,2]*F[1,2] +
+          F[2,0]*F[2,0] + F[2,1]*F[2,1] + F[2,2]*F[2,2])
+    C = wp.sqrt(I1)
+    
+    if C < FLOAT_EPSILON:
+        return
+    
+    # Compute gradient: ∂C/∂x = (1/C) * F * Q^T
+    inv_C = 1.0 / C
+    Q_T = wp.transpose(Q)
+    
+    # Manual matrix multiplication for gradients
+    g1_x = inv_C * (F[0,0]*Q_T[0,0] + F[0,1]*Q_T[1,0] + F[0,2]*Q_T[2,0])
+    g1_y = inv_C * (F[1,0]*Q_T[0,0] + F[1,1]*Q_T[1,0] + F[1,2]*Q_T[2,0])
+    g1_z = inv_C * (F[2,0]*Q_T[0,0] + F[2,1]*Q_T[1,0] + F[2,2]*Q_T[2,0])
+    
+    g2_x = inv_C * (F[0,0]*Q_T[0,1] + F[0,1]*Q_T[1,1] + F[0,2]*Q_T[2,1])
+    g2_y = inv_C * (F[1,0]*Q_T[0,1] + F[1,1]*Q_T[1,1] + F[1,2]*Q_T[2,1])
+    g2_z = inv_C * (F[2,0]*Q_T[0,1] + F[2,1]*Q_T[1,1] + F[2,2]*Q_T[2,1])
+    
+    g3_x = inv_C * (F[0,0]*Q_T[0,2] + F[0,1]*Q_T[1,2] + F[0,2]*Q_T[2,2])
+    g3_y = inv_C * (F[1,0]*Q_T[0,2] + F[1,1]*Q_T[1,2] + F[1,2]*Q_T[2,2])
+    g3_z = inv_C * (F[2,0]*Q_T[0,2] + F[2,1]*Q_T[1,2] + F[2,2]*Q_T[2,2])
+    
+    g1 = wp.vec3(g1_x, g1_y, g1_z)
+    g2 = wp.vec3(g2_x, g2_y, g2_z)
+    g3 = wp.vec3(g3_x, g3_y, g3_z)
+    g0 = -(g1 + g2 + g3)
+    
+    # Constraint mass
+    w_sum = w0 * wp.dot(g0, g0) + \
+            w1 * wp.dot(g1, g1) + \
+            w2 * wp.dot(g2, g2) + \
+            w3 * wp.dot(g3, g3)
+    
+    if w_sum < FLOAT_EPSILON:
+        return
+    
+    # Compliance: α = 1/(μ*V₀)
+    alpha = 1.0 / (mu * V0) / (dT * dT)
+    
+    # XPBD lambda update
+    lam = lambdas[tid]
+    delta_lambda = -(C + alpha * lam) / (w_sum + alpha)
+    lambdas[tid] = lam + delta_lambda
+    
+    # Apply position corrections
+    wp.atomic_add(dP, v0_idx, g0 * delta_lambda)
+    wp.atomic_add(dP, v1_idx, g1 * delta_lambda)
+    wp.atomic_add(dP, v2_idx, g2 * delta_lambda)
+    wp.atomic_add(dP, v3_idx, g3 * delta_lambda)
+    
+    # Update constraint counters
+    wp.atomic_add(constraintsNumber, v0_idx, 1)
+    wp.atomic_add(constraintsNumber, v1_idx, 1)
+    wp.atomic_add(constraintsNumber, v2_idx, 1)
+    wp.atomic_add(constraintsNumber, v3_idx, 1)
+
+
+@wp.kernel
+def stableNeoHookeanHydrostatic(
+    predictedVertex: wp.array(dtype=wp.vec3),
+    dP: wp.array(dtype=wp.vec3),
+    constraintsNumber: wp.array(dtype=int),
+    tetrahedron: wp.array(dtype=int),
+    inverseRestPositions: wp.array(dtype=wp.mat33),
+    lambdas: wp.array(dtype=float),
+    inverseMass: wp.array(dtype=float),
+    restVolume: wp.array(dtype=float),
+    activeTetrahedron: wp.array(dtype=float),
+    mu: float,
+    lambda_param: float,
+    dT: float):
+    """
+    Stable Neo-Hookean Hydrostatic Constraint (Macklin 2017)
+    
+    Constraint: C = -γ + log(J) where γ = μ/λ
+    Taylor series approximation for J < 1 to avoid log(0).
+    Preserves volume while remaining stable under compression.
+    """
+    
+    tid = wp.tid()
+    
+    if activeTetrahedron[tid] < 0.5:
+        return
+    
+    # Get vertex indices from flat array
+    v0_idx = tetrahedron[tid * 4 + 0]
+    v1_idx = tetrahedron[tid * 4 + 1]
+    v2_idx = tetrahedron[tid * 4 + 2]
+    v3_idx = tetrahedron[tid * 4 + 3]
+    
+    # Get current positions
+    p0 = predictedVertex[v0_idx]
+    p1 = predictedVertex[v1_idx]
+    p2 = predictedVertex[v2_idx]
+    p3 = predictedVertex[v3_idx]
+    
+    # Get inverse masses
+    w0 = inverseMass[v0_idx]
+    w1 = inverseMass[v1_idx]
+    w2 = inverseMass[v2_idx]
+    w3 = inverseMass[v3_idx]
+    
+    # Get precomputed values
+    Q = inverseRestPositions[tid]
+    V0 = restVolume[tid]
+    
+    # USD data may have inverted tets (negative det(Q))
+    # Correct by negating Q if its determinant is negative
+    det_Q = wp.determinant(Q)
+    if det_Q < 0.0:
+        Q = -Q
+        V0 = wp.abs(V0)
+    
+    # Compute deformation gradient
+    Ds = wp.mat33(p1 - p0, p2 - p0, p3 - p0)
+    F = Ds * Q
+    
+    # Compute Jacobian (determinant of F)
+    J = wp.determinant(F)
+    
+    # γ = μ/λ (material offset)
+    gamma = mu / (lambda_param + FLOAT_EPSILON)
+    
+    # Compute constraint with Taylor series stability
+    C = 0.0
+    grad_factor = 0.0
+    
+    if J >= 1.0:
+        # Normal case: C = -γ + log(J)
+        C = -gamma + wp.log(J + FLOAT_EPSILON)
+        grad_factor = 1.0 / (J + FLOAT_EPSILON)
+    else:
+        # Compressed case: Taylor series for log(J)
+        J_minus_1 = J - 1.0
+        log_J_approx = J_minus_1 - 0.5*J_minus_1*J_minus_1 + (1.0/3.0)*J_minus_1*J_minus_1*J_minus_1
+        C = -gamma + log_J_approx
+        grad_factor = 1.0 - J_minus_1 + J_minus_1*J_minus_1
+    
+    # Compute cofactor matrix (F_cross) for gradient
+    f0 = wp.vec3(F[0,0], F[1,0], F[2,0])
+    f1 = wp.vec3(F[0,1], F[1,1], F[2,1])
+    f2 = wp.vec3(F[0,2], F[1,2], F[2,2])
+    
+    F_cross_col0 = wp.cross(f1, f2)
+    F_cross_col1 = wp.cross(f2, f0)
+    F_cross_col2 = wp.cross(f0, f1)
+    F_cross = wp.mat33(F_cross_col0, F_cross_col1, F_cross_col2)
+    
+    # Compute gradient: ∂C/∂x = grad_factor * F_cross * Q^T
+    Q_T = wp.transpose(Q)
+    
+    # Manual matrix multiplication
+    g1_x = grad_factor * (F_cross[0,0]*Q_T[0,0] + F_cross[0,1]*Q_T[1,0] + F_cross[0,2]*Q_T[2,0])
+    g1_y = grad_factor * (F_cross[1,0]*Q_T[0,0] + F_cross[1,1]*Q_T[1,0] + F_cross[1,2]*Q_T[2,0])
+    g1_z = grad_factor * (F_cross[2,0]*Q_T[0,0] + F_cross[2,1]*Q_T[1,0] + F_cross[2,2]*Q_T[2,0])
+    
+    g2_x = grad_factor * (F_cross[0,0]*Q_T[0,1] + F_cross[0,1]*Q_T[1,1] + F_cross[0,2]*Q_T[2,1])
+    g2_y = grad_factor * (F_cross[1,0]*Q_T[0,1] + F_cross[1,1]*Q_T[1,1] + F_cross[1,2]*Q_T[2,1])
+    g2_z = grad_factor * (F_cross[2,0]*Q_T[0,1] + F_cross[2,1]*Q_T[1,1] + F_cross[2,2]*Q_T[2,1])
+    
+    g3_x = grad_factor * (F_cross[0,0]*Q_T[0,2] + F_cross[0,1]*Q_T[1,2] + F_cross[0,2]*Q_T[2,2])
+    g3_y = grad_factor * (F_cross[1,0]*Q_T[0,2] + F_cross[1,1]*Q_T[1,2] + F_cross[1,2]*Q_T[2,2])
+    g3_z = grad_factor * (F_cross[2,0]*Q_T[0,2] + F_cross[2,1]*Q_T[1,2] + F_cross[2,2]*Q_T[2,2])
+    
+    g1 = wp.vec3(g1_x, g1_y, g1_z)
+    g2 = wp.vec3(g2_x, g2_y, g2_z)
+    g3 = wp.vec3(g3_x, g3_y, g3_z)
+    g0 = -(g1 + g2 + g3)
+    
+    # Constraint mass
+    w_sum = w0 * wp.dot(g0, g0) + \
+            w1 * wp.dot(g1, g1) + \
+            w2 * wp.dot(g2, g2) + \
+            w3 * wp.dot(g3, g3)
+    
+    if w_sum < FLOAT_EPSILON:
+        return
+    
+    # Compliance: α = 1/(λ*V₀)
+    alpha = 1.0 / (lambda_param * V0) / (dT * dT)
+    
+    # XPBD lambda update
+    lam = lambdas[tid]
+    delta_lambda = -(C + alpha * lam) / (w_sum + alpha)
+    lambdas[tid] = lam + delta_lambda
+    
+    # Apply position corrections
+    wp.atomic_add(dP, v0_idx, g0 * delta_lambda)
+    wp.atomic_add(dP, v1_idx, g1 * delta_lambda)
+    wp.atomic_add(dP, v2_idx, g2 * delta_lambda)
+    wp.atomic_add(dP, v3_idx, g3 * delta_lambda)
+    
+    # Update constraint counters
+    wp.atomic_add(constraintsNumber, v0_idx, 1)
+    wp.atomic_add(constraintsNumber, v1_idx, 1)
+    wp.atomic_add(constraintsNumber, v2_idx, 1)
+    wp.atomic_add(constraintsNumber, v3_idx, 1)
+
+
 @wp.kernel
 def edgeBreakerKernel(predictedVertex: wp.array(dtype=wp.vec3),
                       edge: wp.array(dtype=int),
@@ -1678,6 +1946,39 @@ class SimIntegratorDO():
                                   simModel.activeEdge,
                                   simModel.globalKsDistance],
                           device=simModel.device)
+                
+                # Stable Neo-Hookean constraints (Macklin 2017) - only if enabled
+                if simModel.useStableNH and simModel.tetrahedronInverseRestPositionNeoHookean is not None:
+                    wp.launch(kernel=stableNeoHookeanDeviatoric,
+                              dim=simModel.numTetrahedrons,
+                              inputs=[simModel.predictedVertex,
+                                      simModel.dP,
+                                      simModel.constraintsNumber,
+                                      simModel.tetrahedron,
+                                      simModel.tetrahedronInverseRestPositionNeoHookean,
+                                      simModel.stableNHDeviatoricLambda,
+                                      simModel.inverseMass,
+                                      simModel.tetrahedronRestVolume,
+                                      simModel.activeTetrahedron,
+                                      simModel.globalMu,
+                                      simModel.simDt],
+                              device=simModel.device)
+                    
+                    wp.launch(kernel=stableNeoHookeanHydrostatic,
+                              dim=simModel.numTetrahedrons,
+                              inputs=[simModel.predictedVertex,
+                                      simModel.dP,
+                                      simModel.constraintsNumber,
+                                      simModel.tetrahedron,
+                                      simModel.tetrahedronInverseRestPositionNeoHookean,
+                                      simModel.stableNHHydrostaticLambda,
+                                      simModel.inverseMass,
+                                      simModel.tetrahedronRestVolume,
+                                      simModel.activeTetrahedron,
+                                      simModel.globalMu,
+                                      simModel.globalLambda,
+                                      simModel.simDt],
+                              device=simModel.device)
                 
                 wp.launch(kernel=applyConstraints,
                           dim=simModel.numVertices,

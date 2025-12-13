@@ -38,7 +38,7 @@ class TestStandalone():
         self.dt = 1. / float(self.fps)
         self.sim_substeps = 20
         
-        self.constraintSteps = 1
+        self.constraintSteps = 10  # Increased from 1 to 5 for better stability
         self.sim_dt = self.dt / float(self.sim_substeps)
         self.sim_time = 0.0
         self.render_time = 0.0

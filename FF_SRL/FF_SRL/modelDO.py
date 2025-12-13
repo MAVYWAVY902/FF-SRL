@@ -527,6 +527,10 @@ class SimMeshDO(dk.SimObject):
         self.neoHookeanLambda = None
         self.activeTetrahedron = None
         self.flipTetrahedron = None
+        
+        # Stable Neo-Hookean lambdas (separate for deviatoric and hydrostatic)
+        self.stableNHDeviatoricLambda = None
+        self.stableNHHydrostaticLambda = None
 
         # Constraints
         self.constraintsNumber = None
@@ -598,8 +602,32 @@ class SimMeshDO(dk.SimObject):
         meshTetrahedrons = meshTetrahedrons.ravel()
         meshTetrahedronsRestVolumes = self.prim.GetAttribute("extMesh:tetrahedronRestVolume").Get()
         meshTetrahedronsInverseMassesNeoHookean = self.prim.GetAttribute("extMesh:inverseMassNeoHookean").Get()
-        meshTetrahedronsInverseRestPositionsNeoHookean = self.prim.GetAttribute("extMesh:inverseRestPosition").Get()
-        meshTetrahedronsInverseRestPositionsNeoHookean = np.array(meshTetrahedronsInverseRestPositionsNeoHookean).reshape((-1, 3, 3))
+        
+        # CRITICAL: USD's inverseRestPosition data is incorrect (negative determinants)
+        # Recompute Q matrices from rest vertex positions, matching C++ implementation:
+        # X = [v0-v3, v1-v3, v2-v3], Q = X^-1
+        print(f"Recomputing Q matrices for {int(len(meshTetrahedrons)/4)} tetrahedra...")
+        meshTetrahedronsInverseRestPositionsNeoHookean = []
+        for i in range(0, len(meshTetrahedrons), 4):
+            v0_idx = int(meshTetrahedrons[i])
+            v1_idx = int(meshTetrahedrons[i+1])
+            v2_idx = int(meshTetrahedrons[i+2])
+            v3_idx = int(meshTetrahedrons[i+3])
+            
+            v0 = np.array(meshVertices[v0_idx], dtype=np.float64)
+            v1 = np.array(meshVertices[v1_idx], dtype=np.float64)
+            v2 = np.array(meshVertices[v2_idx], dtype=np.float64)
+            v3 = np.array(meshVertices[v3_idx], dtype=np.float64)
+            
+            # Build rest shape matrix: X = [v0-v3, v1-v3, v2-v3]
+            X = np.column_stack([v0 - v3, v1 - v3, v2 - v3])
+            
+            # Compute Q = X^-1
+            Q = np.linalg.inv(X)
+            meshTetrahedronsInverseRestPositionsNeoHookean.append(Q)
+        
+        meshTetrahedronsInverseRestPositionsNeoHookean = np.array(meshTetrahedronsInverseRestPositionsNeoHookean)
+        print(f"Q matrix recomputation complete. Sample det(Q): {np.linalg.det(meshTetrahedronsInverseRestPositionsNeoHookean[0]):.6f}")
 
         self.numVertices = len(meshVertices)
         self.numVisPoints = len(self.meshVisPoints)
@@ -625,6 +653,7 @@ class SimMeshDO(dk.SimObject):
 
         self.tetrahedron = meshTetrahedrons
         self.tetrahedronRestVolume = meshTetrahedronsRestVolumes
+        self.inverseRestPositions = meshTetrahedronsInverseRestPositionsNeoHookean
 
         # check if object has material
         bindingAPI = UsdShade.MaterialBindingAPI(self.prim)
@@ -832,7 +861,13 @@ class SimModelDO():
             self.globalKsDrag = globalKsDrag
             self.globalVolumeComplianceNeoHookean = globalVolumeCompliance
             self.gloabalDeviatoricComplianceNeoHookean = globalDeviatoricCompliance
-
+            
+            # Stable Neo-Hookean material parameters (in Pascals)
+            # Default values for soft tissue: μ ≈ 1000 Pa, λ ≈ 5000 Pa
+            self.globalMu = 1000.0  # Shear modulus (Pa)
+            self.globalLambda = 5000.0  # First Lamé parameter (Pa)
+            self.useStableNH = True  # Set to True to enable Stable Neo-Hookean constraints
+            
             self.globalLaparoscopeDragLookupRadius = globalLaparoscopeDragLookupRadius
 
             self.globalBreakFactor = globalBreakFactor
@@ -863,6 +898,7 @@ class SimModelDO():
             meshVisPointColors = []
             tetrahedron = None
             tetrahedronRestVolume = None
+            inverseRestPositions = None
             edge = None
             edgeRestLength = None
 
@@ -937,6 +973,11 @@ class SimModelDO():
                             tetrahedronRestVolume = np.concatenate((tetrahedronRestVolume, simMesh.tetrahedronRestVolume))
                         else:
                             tetrahedronRestVolume = simMesh.tetrahedronRestVolume
+
+                        if not inverseRestPositions is None:
+                            inverseRestPositions = np.concatenate((inverseRestPositions, simMesh.inverseRestPositions))
+                        else:
+                            inverseRestPositions = simMesh.inverseRestPositions
 
                         if not edge is None:
                             edge = np.concatenate((edge, simMesh.edge + currentVertices))
@@ -1160,6 +1201,16 @@ class SimModelDO():
                 self.activeTetrahedron = wp.array([1.0] * int(len(self.tetrahedron)/4), dtype=wp.float32, device=self.device)
                 self.tetrahedronRestVolume = wp.array(tetrahedronRestVolume, dtype=wp.float32, device=self.device)
                 self.tetrahedronDP = wp.zeros(len(self.activeTetrahedron) * 4, dtype=wp.vec3, device=self.device)
+                
+                # Stable Neo-Hookean lambda arrays (one per tetrahedron for each constraint type)
+                self.stableNHDeviatoricLambda = wp.zeros(int(len(self.tetrahedron)/4), dtype=wp.float32, device=self.device)
+                self.stableNHHydrostaticLambda = wp.zeros(int(len(self.tetrahedron)/4), dtype=wp.float32, device=self.device)
+                
+                # Inverse rest positions for Stable Neo-Hookean (Q matrix)
+                if inverseRestPositions is not None:
+                    self.tetrahedronInverseRestPositionNeoHookean = wp.array(inverseRestPositions, dtype=wp.mat33, device=self.device)
+                else:
+                    self.tetrahedronInverseRestPositionNeoHookean = None
 
                 # Edges
                 self.edge = wp.array(edge, dtype=wp.int32, device=self.device)
