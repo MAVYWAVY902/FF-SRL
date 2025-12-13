@@ -5,3 +5,8 @@ from FF_SRL.utils import launchTransformVecArrayWarp, transformVecArray, getBoxS
 from FF_SRL.render import WarpRaycastRendererDO
 from FF_SRL.laparoscope import SimLaparoscopeDO
 from FF_SRL.bvh import SimBVH
+
+# Interaction system modules (new)
+from FF_SRL import input_handler
+from FF_SRL import camera_controller
+from FF_SRL import tool_controller
