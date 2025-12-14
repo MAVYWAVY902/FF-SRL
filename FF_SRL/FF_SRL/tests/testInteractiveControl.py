@@ -129,6 +129,11 @@ class InteractiveSimulation:
         # CUDA graph optimization (only for simulation, renderer has its own)
         self.sim_graph = None
         
+        # Frame rate control
+        self.target_fps = 60
+        self.frame_time = 1.0 / self.target_fps
+        self.last_frame_time = time.time()
+        
         print("Initialization complete!")
         self._print_controls()
     
@@ -300,8 +305,10 @@ class InteractiveSimulation:
     def step(self):
         """Simulation step"""
         if not self.paused:
-            # Apply tool actions
-            self.tool_controller.apply_actions(self.num_envs)
+            # Apply tool actions only if there's been input or grasping is active
+            if (self.tool_controller.has_input() or 
+                self.tool_controller.is_grasping):
+                self.tool_controller.apply_actions(self.num_envs)
             
             # Physics step - use Reduce version for single environment (faster)
             if self.sim_graph is None:
@@ -347,6 +354,18 @@ class InteractiveSimulation:
         iteration = 0
         try:
             while self.running and iteration < max_iterations:
+                # Frame timing
+                current_time = time.time()
+                delta_time = current_time - self.last_frame_time
+                
+                # Limit frame rate
+                if delta_time < self.frame_time:
+                    time.sleep(self.frame_time - delta_time)
+                    current_time = time.time()
+                    delta_time = current_time - self.last_frame_time
+                
+                self.last_frame_time = current_time
+                
                 # Update input
                 self.update_input()
                 

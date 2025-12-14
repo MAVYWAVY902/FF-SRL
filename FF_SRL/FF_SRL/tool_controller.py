@@ -81,6 +81,13 @@ class ToolController:
         # Grasping state
         self.is_grasping = False
         
+    def has_input(self) -> bool:
+        """
+        Check if there are any pending actions
+        Returns True if cartesian_actions is non-zero
+        """
+        return torch.any(self.cartesian_actions != 0.0).item()
+        
     def update_from_keyboard(self, input_handler: InputHandler):
         """
         Update tool actions from keyboard input
@@ -243,12 +250,22 @@ class ToolController:
                 )
                 self.cartesian_actions = new_pos - current_pos
             
-            # Repeat actions for all environments
-            actions_repeated = self.cartesian_actions.repeat(num_envs)
+            # cartesian_actions is shape [3] (x, y, z)
+            # For multiple environments, need to repeat to get [3*num_envs] in 1D
+            # e.g., [x, y, z] -> [x, y, z, x, y, z] for 2 envs
+            if num_envs > 1:
+                # Stack num_envs copies and flatten to 1D
+                actions_to_apply = torch.cat([self.cartesian_actions] * num_envs)
+            else:
+                # Single environment: just use [3] directly
+                actions_to_apply = self.cartesian_actions
             
-            # Apply to model
+            # Ensure it's 1D before converting to Warp
+            actions_to_apply = actions_to_apply.flatten()
+            
+            # Apply to model (must be 1D array)
             self.sim_model.applyCartesianActionsInWorkspace(
-                wp.from_torch(actions_repeated)
+                wp.from_torch(actions_to_apply)
             )
         
         # Reset actions for next frame
