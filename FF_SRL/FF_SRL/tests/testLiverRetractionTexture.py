@@ -1,7 +1,13 @@
+# CRITICAL: Set NVIDIA GPU for OpenGL BEFORE any imports
+# This fixes CUDA-OpenGL interop on hybrid GPU laptops
+import os
+os.environ['__NV_PRIME_RENDER_OFFLOAD'] = '1'
+os.environ['__GLX_VENDOR_LIBRARY_NAME'] = 'nvidia'
+os.environ['__VK_LAYER_NV_optimus'] = 'NVIDIA_only'
+
 import torch
 from pynput import keyboard
 
-import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

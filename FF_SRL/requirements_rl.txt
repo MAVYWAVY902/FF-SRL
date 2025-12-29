@@ -1,0 +1,34 @@
+# RL Training Dependencies for FF-SRL
+# Install with: pip install -r requirements_rl.txt
+#
+# IMPORTANT: NumPy version must be < 2.0.0 for compatibility with torchwindow
+# which is required by the base FF-SRL package
+
+# Core RL framework
+rl-games>=1.6.0
+gymnasium>=0.28.0
+
+# Deep learning
+torch>=1.10.0
+torchvision>=0.11.0
+
+# Visualization and logging
+matplotlib>=3.3.0
+tensorboard>=2.8.0
+pyyaml>=5.4.0
+
+# Data processing - PINNED for torchwindow compatibility
+numpy>=1.23.4,<2.0.0
+scipy>=1.5.0
+
+# Video recording (optional) - PINNED for NumPy 1.x compatibility
+opencv-python>=4.5.0,<4.10.0
+imageio>=2.9.0
+imageio-ffmpeg>=0.4.0
+
+# Progress bars
+tqdm>=4.60.0
+
+# Utilities
+pandas>=1.1.0
+seaborn>=0.11.0

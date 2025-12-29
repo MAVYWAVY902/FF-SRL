@@ -661,11 +661,24 @@ class SimMeshDO(dk.SimObject):
         pathList = rel.GetTargets()
         if len(pathList) > 0:
             primMat = self.prim.GetStage().GetPrimAtPath(pathList[0].pathString + "/Shader")
-            self.texture = primMat.GetAttribute("inputs:diffuse_texture").Get().resolvedPath
-            self.texCoords = self.prim.GetAttribute("primvars:st").Get()
-            if self.prim.GetAttribute("primvars:st:indices"):
-                self.texIndices = self.prim.GetAttribute("primvars:st:indices").Get()
-            else:
+
+            # Some scenes bind materials without a usable Shader prim or without a diffuse texture.
+            # Treat those meshes as untextured instead of crashing.
+            if primMat and primMat.IsValid():
+                diffuse_attr = primMat.GetAttribute("inputs:diffuse_texture")
+                if diffuse_attr and diffuse_attr.HasAuthoredValue():
+                    asset_path = diffuse_attr.Get()
+                    if asset_path is not None and getattr(asset_path, "resolvedPath", None):
+                        self.texture = asset_path.resolvedPath
+
+            st_attr = self.prim.GetAttribute("primvars:st")
+            if st_attr and st_attr.HasAuthoredValue():
+                self.texCoords = st_attr.Get()
+
+            st_idx_attr = self.prim.GetAttribute("primvars:st:indices")
+            if st_idx_attr and st_idx_attr.HasAuthoredValue():
+                self.texIndices = st_idx_attr.Get()
+            elif self.texCoords is not None:
                 self.texIndices = meshVisFaces
 
 class SimRigidDO(dk.SimObject):
@@ -1549,6 +1562,37 @@ class SimModelDO():
         tipTensor = wp.to_torch(self.laparoscopeTip)
 
         return tipTensor[3 : : 4]
+    
+    def getModelObservationsTensor(self):
+        """
+        Get laparoscope observations for all environments as a single tensor.
+        Returns tensor of shape [num_envs, 6] containing base and tip positions.
+        Used by RL environment wrapper.
+        """
+        baseTensor = wp.to_torch(self.laparoscopeBase, requires_grad=False)
+        tipTensor = wp.to_torch(self.laparoscopeTip, requires_grad=False)
+        
+        # Extract effector (tip) positions for each environment
+        # laparoscopeTip has shape [num_envs * 4, 3], we want indices [3, 7, 11, ...]
+        tipPositions = tipTensor[3::4]  # Shape: [num_envs, 3]
+        
+        # Also get base positions if needed
+        basePositions = baseTensor[3::4]  # Shape: [num_envs, 3]
+        
+        # Concatenate base and tip for full observation
+        # Shape: [num_envs, 6]
+        observations = torch.cat([basePositions, tipPositions], dim=1)
+        
+        return observations
+    
+    def getModelRewardTensor(self):
+        """
+        Get mesh vertex positions for all environments for reward calculation.
+        Returns tensor containing all vertex positions.
+        Used by RL environment wrapper.
+        """
+        vertexTensor = wp.to_torch(self.vertex, requires_grad=False)
+        return vertexTensor
     
     def getLaparoscopeClampVertex(self, vertexId):
 

@@ -7,10 +7,18 @@ Demonstrates:
 - Easy3D-style interaction
 """
 
+# CRITICAL: Set NVIDIA GPU for OpenGL BEFORE any imports
+# This fixes CUDA-OpenGL interop on hybrid GPU laptops
+import os
+os.environ['__NV_PRIME_RENDER_OFFLOAD'] = '1'
+os.environ['__GLX_VENDOR_LIBRARY_NAME'] = 'nvidia'
+os.environ['__VK_LAYER_NV_optimus'] = 'NVIDIA_only'
+
 import torch
 from pynput import keyboard, mouse
 import os
 import sys
+import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import warp as wp
@@ -70,6 +78,9 @@ class InteractiveSimulation:
         )
         
         print("Initializing renderer...")
+        # Try "human" mode instead of "gpu" to avoid CUDA-OpenGL interop issues on hybrid GPUs
+        # Change back to "gpu" if you're on a system with only NVIDIA GPU
+        render_mode = "gpu"  # Options: "gpu", "human", "debug"
         self.renderer = dk.render.WarpRaycastRendererDO(
             device=self.device,
             simModel=self.sim_model,
@@ -78,7 +89,7 @@ class InteractiveSimulation:
             cameraRot=[0.0, 0.0, 0.0],
             lightPos=[0.0, 15.0, 80.0],
             lightIntensity=0.03,
-            mode="gpu",
+            mode=render_mode,
             horizontalAperture=45,
             verticalAperture=45
         )

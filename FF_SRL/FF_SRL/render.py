@@ -1,13 +1,24 @@
+import os
+import sys
+
+# CRITICAL: Apply NVIDIA patch for hybrid GPU systems BEFORE any graphics imports
+# This fixes CUDA-OpenGL interop issues on laptops with Intel + NVIDIA GPUs
+try:
+    from . import torchwindow_nvidia_patch
+except:
+    # Fallback: manually set environment variables
+    os.environ.setdefault('__NV_PRIME_RENDER_OFFLOAD', '1')
+    os.environ.setdefault('__GLX_VENDOR_LIBRARY_NAME', 'nvidia')
+    os.environ.setdefault('__VK_LAYER_NV_optimus', 'NVIDIA_only')
+
 import warp as wp
 import FF_SRL as dk
 import numpy as np
 import torch
 import math
-import sys
 import matplotlib.pyplot as plt
 import climage
 from torchwindow import Window
-import os
 import time
 
 FLOAT_EPSILON = wp.constant(sys.float_info.epsilon)
