@@ -1121,6 +1121,7 @@ class WarpRaycastRendererDO:
                     self.renderFunctionNew(simBVH)
                     self.renderGraph = wp.capture_end()
                 wp.capture_launch(self.renderGraph)
+                
                 image = wp.to_torch(self.pixels).view(self.numEnvs, self.height, self.width, 3)
 
                 for i in range(simModel.numEnvs):

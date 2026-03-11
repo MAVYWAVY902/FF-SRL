@@ -4,6 +4,8 @@ import sys
 import numpy as np
 import FF_SRL as dk
 from pxr import Usd, UsdGeom, Gf
+from FF_SRL.adhesion import (unifiedAdhesionConstraintsDO, resetAdhesionCacheKernel,
+                              rigidDeformAdhesionConstraintsDO, resetRigidAdhesionCacheKernel)
 
 FLOAT_EPSILON = wp.constant(sys.float_info.epsilon)
 in_de_crease_steps = 5
@@ -1920,31 +1922,70 @@ class SimIntegratorDO():
                               simModel.simDt],
                       device=simModel.device)
 
-            # Evaluate constraints
+            # Reset XPBD lambda accumulators at start of each substep
+            wp.launch(kernel=zeroFloatArray,
+                      dim=simModel.numEdges,
+                      inputs=[simModel.edgeLambda],
+                      device=simModel.device)
+            wp.launch(kernel=zeroFloatArray,
+                      dim=simModel.numTetrahedrons,
+                      inputs=[simModel.volumeLambda],
+                      device=simModel.device)
+            if simModel.useStableNH and simModel.tetrahedronInverseRestPositionNeoHookean is not None:
+                wp.launch(kernel=zeroFloatArray,
+                          dim=simModel.numTetrahedrons,
+                          inputs=[simModel.stableNHDeviatoricLambda],
+                          device=simModel.device)
+                wp.launch(kernel=zeroFloatArray,
+                          dim=simModel.numTetrahedrons,
+                          inputs=[simModel.stableNHHydrostaticLambda],
+                          device=simModel.device)
+
+            # Reset adhesion frozen contact frame at start of each substep
+            if simModel.numAdhesionBonds > 0:
+                wp.launch(kernel=resetAdhesionCacheKernel,
+                          dim=simModel.numAdhesionBonds,
+                          inputs=[simModel.adhesionCacheValid],
+                          device=simModel.device)
+
+            # Reset rigid-deform adhesion cache
+            if simModel.numRigidAdhesionBonds > 0:
+                wp.launch(kernel=resetRigidAdhesionCacheKernel,
+                          dim=simModel.numRigidAdhesionBonds,
+                          inputs=[simModel.rigidAdhesionCacheValid],
+                          device=simModel.device)
+
+            # Evaluate constraints (XPBD)
             for j in range(simModel.simConstraints):
-            
-                wp.launch(kernel=volumeConstraints,
+
+                wp.launch(kernel=volumeConstraintsXPBD,
                           dim=simModel.numTetrahedrons,
                           inputs=[simModel.predictedVertex,
                                   simModel.dP,
+                                  simModel.volumeLambda,
                                   simModel.constraintsNumber,
-                                  simModel.tetrahedron,
+                                  simModel.tetrahedronA,
+                                  simModel.tetrahedronB,
+                                  simModel.tetrahedronC,
+                                  simModel.tetrahedronD,
                                   simModel.tetrahedronRestVolume,
                                   simModel.inverseMass,
                                   simModel.activeTetrahedron,
-                                  simModel.globalKsVolume],
+                                  simModel.globalVolumeCompliance],
                           device=simModel.device)
 
-                wp.launch(kernel=distanceConstraints,
+                wp.launch(kernel=distanceConstraintsXPBD,
                           dim=simModel.numEdges,
                           inputs=[simModel.predictedVertex,
                                   simModel.dP,
+                                  simModel.edgeLambda,
                                   simModel.constraintsNumber,
-                                  simModel.edge,
+                                  simModel.edgeA,
+                                  simModel.edgeB,
                                   simModel.edgeRestLength,
                                   simModel.inverseMass,
                                   simModel.activeEdge,
-                                  simModel.globalKsDistance],
+                                  simModel.globalDistanceCompliance],
                           device=simModel.device)
                 
                 # Stable Neo-Hookean constraints (Macklin 2017) - only if enabled
@@ -1980,13 +2021,59 @@ class SimIntegratorDO():
                                       simModel.simDt],
                               device=simModel.device)
                 
+                # Unified adhesion constraints - deform-deform (e.g., tumor-tissue)
+                if simModel.numAdhesionBonds > 0:
+                    wp.launch(kernel=unifiedAdhesionConstraintsDO,
+                              dim=simModel.numAdhesionBonds,
+                              inputs=[simModel.predictedVertex,
+                                      simModel.dP,
+                                      simModel.constraintsNumber,
+                                      simModel.adhesionVertexId,
+                                      simModel.adhesionTriId,
+                                      simModel.adhesionTriBar,
+                                      simModel.adhesionRestGap,
+                                      simModel.adhesionActive,
+                                      simModel.adhesionNormalCache,
+                                      simModel.adhesionCacheValid,
+                                      simModel.globalAdhesionDContact,
+                                      simModel.globalAdhesionDRest,
+                                      simModel.globalAdhesionDNeutralStart,
+                                      simModel.globalAdhesionBreakRatio,
+                                      simModel.globalAdhesionStretchAbsMin,
+                                      simModel.globalAdhesionAlpha,
+                                      simModel.simDt],
+                              device=simModel.device)
+
+                # Unified adhesion constraints - rigid-deform (e.g., tumor-bone)
+                if simModel.numRigidAdhesionBonds > 0:
+                    wp.launch(kernel=rigidDeformAdhesionConstraintsDO,
+                              dim=simModel.numRigidAdhesionBonds,
+                              inputs=[simModel.predictedVertex,
+                                      simModel.dP,
+                                      simModel.constraintsNumber,
+                                      simModel.rigidAdhesionRigidPoint,
+                                      simModel.rigidAdhesionTriId,
+                                      simModel.rigidAdhesionTriBar,
+                                      simModel.rigidAdhesionRestGap,
+                                      simModel.rigidAdhesionActive,
+                                      simModel.rigidAdhesionNormalCache,
+                                      simModel.rigidAdhesionCacheValid,
+                                      simModel.globalAdhesionDContact,
+                                      simModel.globalAdhesionDRest,
+                                      simModel.globalAdhesionDNeutralStart,
+                                      simModel.globalAdhesionBreakRatio,
+                                      simModel.globalAdhesionStretchAbsMin,
+                                      simModel.globalAdhesionAlpha,
+                                      simModel.simDt],
+                              device=simModel.device)
+
                 wp.launch(kernel=applyConstraints,
                           dim=simModel.numVertices,
                           inputs=[simModel.predictedVertex,
                                   simModel.dP,
                                   simModel.constraintsNumber],
                           device=simModel.device)
-                
+
                 wp.launch(kernel=dragConstraintsDO,
                           dim=len(simModel.predictedVertex),
                           inputs=[simModel.predictedVertex,

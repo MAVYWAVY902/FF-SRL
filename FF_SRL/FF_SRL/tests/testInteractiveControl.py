@@ -15,6 +15,7 @@ os.environ['__GLX_VENDOR_LIBRARY_NAME'] = 'nvidia'
 os.environ['__VK_LAYER_NV_optimus'] = 'NVIDIA_only'
 
 import torch
+import time
 from pynput import keyboard, mouse
 import os
 import sys
@@ -45,11 +46,11 @@ class InteractiveSimulation:
         self.device = "cuda:0"
         self.num_envs = num_envs
         
-        # Simulation parameters
-        self.fps = 20
+        # Simulation parameters (optimized for real-time interaction)
+        self.fps = 60  # Target visual FPS
         self.dt = 1.0 / float(self.fps)
-        self.sim_substeps = 20
-        self.constraint_steps = 10
+        self.sim_substeps = 10  # Subdivide 16.7ms into ~1.7ms steps (closer to C++ 1ms)
+        self.constraint_steps = 1  # Match C++ project (1 solver iteration per substep)
         self.sim_dt = self.dt / float(self.sim_substeps)
         
         # Workspace limits
@@ -140,9 +141,9 @@ class InteractiveSimulation:
         # CUDA graph optimization (only for simulation, renderer has its own)
         self.sim_graph = None
         
-        # Frame rate control
-        self.target_fps = 60
-        self.frame_time = 1.0 / self.target_fps
+        # Frame rate control (disabled for max performance)
+        self.target_fps = 0  # 0 = unlimited
+        self.frame_time = 1.0 / 1000.0 if self.target_fps == 0 else 1.0 / self.target_fps
         self.last_frame_time = time.time()
         
         print("Initialization complete!")
@@ -316,12 +317,11 @@ class InteractiveSimulation:
     def step(self):
         """Simulation step"""
         if not self.paused:
-            # Apply tool actions only if there's been input or grasping is active
-            if (self.tool_controller.has_input() or 
-                self.tool_controller.is_grasping):
+            # Apply tool actions BEFORE Graph (outside capture)
+            if torch.any(self.tool_controller.cartesian_actions != 0.0):
                 self.tool_controller.apply_actions(self.num_envs)
             
-            # Physics step - use Reduce version for single environment (faster)
+            # Physics step - use CUDA Graph
             if self.sim_graph is None:
                 wp.capture_begin()
                 if self.sim_model.reduce:
@@ -331,14 +331,22 @@ class InteractiveSimulation:
                 self.sim_graph = wp.capture_end()
             else:
                 wp.capture_launch(self.sim_graph)
+            
+            # Reset actions after simulation
+            self.tool_controller.cartesian_actions.zero_()
     
     def render(self):
         """Render frame"""
-        self.sim_bvh.refitBVH(useGraph=True)
+        # 🚀 优化：BVH 和渲染降频到每 2 帧（提高响应性）
+        if not hasattr(self, '_render_counter'):
+            self._render_counter = 0
         
-        # renderNew() handles graph capture internally - just call it
-        # (it creates its own graph inside, we don't need to capture here)
-        self.renderer.renderNew(self.sim_bvh, self.sim_model)
+        self._render_counter += 1
+        
+        # 每 2 帧执行一次 BVH 更新和渲染（原来是 5 帧）
+        if self._render_counter % 2 == 0:
+            self.sim_bvh.refitBVH(useGraph=True)
+            self.renderer.renderNew(self.sim_bvh, self.sim_model)
     
     def run(self, max_iterations=10000):
         """Main simulation loop"""
@@ -363,21 +371,14 @@ class InteractiveSimulation:
         
         # Main loop
         iteration = 0
+        last_print_time = time.time()
+        frame_times = []
+        
         try:
             while self.running and iteration < max_iterations:
-                # Frame timing
-                current_time = time.time()
-                delta_time = current_time - self.last_frame_time
+                frame_start = time.time()
                 
-                # Limit frame rate
-                if delta_time < self.frame_time:
-                    time.sleep(self.frame_time - delta_time)
-                    current_time = time.time()
-                    delta_time = current_time - self.last_frame_time
-                
-                self.last_frame_time = current_time
-                
-                # Update input
+                # Update input (CPU only, fast)
                 self.update_input()
                 
                 # Simulation step
@@ -385,6 +386,21 @@ class InteractiveSimulation:
                 
                 # Render
                 self.render()
+                
+                # 🚀 优化：只在需要统计时才同步（减少开销）
+                frame_time = (time.time() - frame_start) * 1000
+                frame_times.append(frame_time)
+                
+                # Print performance stats every second
+                if time.time() - last_print_time > 1.0:
+                    # 只在打印时同步一次，获取准确的GPU时间
+                    wp.synchronize()
+                    
+                    avg_frame_time = sum(frame_times) / len(frame_times)
+                    fps = 1000.0 / avg_frame_time if avg_frame_time > 0 else 0
+                    print(f"FPS: {fps:.1f} | Frame: {avg_frame_time:.1f}ms")
+                    frame_times = []
+                    last_print_time = time.time()
                 
                 iteration += 1
                 

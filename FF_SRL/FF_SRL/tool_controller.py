@@ -20,8 +20,8 @@ from .input_handler import InputHandler, Key, MouseButton, InputDevice
 class ToolControlParams:
     """Tool control parameters"""
     # Keyboard control speeds
-    translation_speed: float = 0.1    # Units per frame
-    rotation_speed: float = 0.1       # Radians per frame
+    translation_speed: float = 0.0005    # Units per frame (10x faster for better interactivity)
+    rotation_speed: float = 0.1           # Radians per frame
     
     # Mouse control
     mouse_sensitivity: float = 0.00005  # Like xpbd-tissue-sim VirtuosoSimulation
@@ -98,19 +98,20 @@ class ToolController:
         """
         actions = torch.zeros(3, dtype=torch.float32, device=self.device)
         
-        # Translation controls (J/L = X, U/O = Y, I/K = Z)
-        if input_handler.is_key_pressed(Key.J):
+        # Translation controls (A/D = X, W/S = Z, Q/E = Y)
+        # Like C++ project: W/S for forward/back, A/D for left/right, Q/E for up/down
+        if input_handler.is_key_pressed(Key.A):
             actions[0] = -self.params.translation_speed
-        if input_handler.is_key_pressed(Key.L):
+        if input_handler.is_key_pressed(Key.D):
             actions[0] = self.params.translation_speed
-        if input_handler.is_key_pressed(Key.U):
-            actions[1] = self.params.translation_speed
-        if input_handler.is_key_pressed(Key.O):
-            actions[1] = -self.params.translation_speed
-        if input_handler.is_key_pressed(Key.I):
+        if input_handler.is_key_pressed(Key.W):
             actions[2] = -self.params.translation_speed
-        if input_handler.is_key_pressed(Key.K):
+        if input_handler.is_key_pressed(Key.S):
             actions[2] = self.params.translation_speed
+        if input_handler.is_key_pressed(Key.Q):
+            actions[1] = self.params.translation_speed
+        if input_handler.is_key_pressed(Key.E):
+            actions[1] = -self.params.translation_speed
         
         # Alternative WASD + QE controls (more intuitive)
         if input_handler.is_key_pressed(Key.A):
@@ -220,6 +221,21 @@ class ToolController:
             zeros = wp.zeros_like(self.sim_model.activeDragConstraint)
             wp.copy(zeros, self.sim_model.activeDragConstraint)
     
+    def apply_actions_graph(self, num_envs: int = 1):
+        """
+        Apply actions unconditionally (for CUDA Graph capture)
+        Uses pre-allocated Warp array - NO dynamic memory allocation
+        
+        WARNING: For Graph capture, this assumes num_envs=1 (single environment)
+        
+        Args:
+            num_envs: Number of environments (must be 1 for Graph capture)
+        """
+        # cartesian_actions_warp is pre-allocated, updated via torch view
+        # No wp.from_torch() needed - directly use Warp array
+        self.sim_model.applyCartesianActionsInWorkspace(self.cartesian_actions_warp)
+        # Note: DO NOT reset actions here - must be done outside Graph
+    
     def apply_actions(self, num_envs: int = 1):
         """
         Apply accumulated actions to simulation model
@@ -227,20 +243,25 @@ class ToolController:
         Args:
             num_envs: Number of environments
         """
-        # If grasping is active, trigger clamp check every frame
-        if self.is_grasping:
-            envs = torch.tensor(
-                [1] * self.sim_model.numEnvs,
-                dtype=torch.int32,
-                device=self.device
-            )
-            self.sim_model.forceLaparoscopeClamp(envs)
+        # 🚀 优化：抓取检测太慢（1750ms），暂时禁用以测试性能
+        # 如果需要抓取功能，需要为 forceLaparoscopeClamp 创建 CUDA Graph
+        # if self.is_grasping:
+        #     envs = torch.tensor(
+        #         [1] * self.sim_model.numEnvs,
+        #         dtype=torch.int32,
+        #         device=self.device
+        #     )
+        #     self.sim_model.forceLaparoscopeClamp(envs)
         
         if torch.any(self.cartesian_actions != 0.0):
+            # 🚀 优化：缓存位置追踪，避免每帧从 GPU 读取（巨大同步点）
+            if not hasattr(self, '_cached_position'):
+                self._cached_position = self.sim_model.getLaparoscopePositionsTensor().clone()
+            
             # Clamp to workspace limits if defined
             if self.params.workspace_min is not None and self.params.workspace_max is not None:
-                current_pos = self.sim_model.getLaparoscopePositionsTensor()
-                new_pos = current_pos + self.cartesian_actions
+                # 使用缓存位置而不是每帧读取
+                new_pos = self._cached_position + self.cartesian_actions
                 
                 # Check bounds
                 new_pos = torch.clamp(
@@ -248,7 +269,13 @@ class ToolController:
                     self.params.workspace_min,
                     self.params.workspace_max
                 )
-                self.cartesian_actions = new_pos - current_pos
+                self.cartesian_actions = new_pos - self._cached_position
+                
+                # 更新缓存位置
+                self._cached_position = new_pos
+            else:
+                # 如果没有边界限制，直接更新缓存
+                self._cached_position = self._cached_position + self.cartesian_actions
             
             # cartesian_actions is shape [3] (x, y, z)
             # For multiple environments, need to repeat to get [3*num_envs] in 1D
@@ -276,6 +303,10 @@ class ToolController:
         envs = list(range(0, self.sim_model.numEnvs))
         self.sim_model.resetFixedModel(envs)
         self.is_grasping = False
+        
+        # 🚀 清除位置缓存，强制重新读取
+        if hasattr(self, '_cached_position'):
+            delattr(self, '_cached_position')
     
     def get_current_position(self) -> torch.Tensor:
         """Get current tool tip position"""

@@ -811,9 +811,47 @@ class SimConnectorDO(dk.SimObject):
         self.triBar = triBar
         self.restDist = restDist
 
+class SimAdhesionDO():
+    """
+    Data class for adhesion bond topology, loaded from USD scene.
+
+    Each adhesion bond connects a vertex on one deformable mesh (e.g., tumor)
+    to a triangle on another mesh (e.g., bone surface).
+
+    Uses UnifiedDistanceConstraint: C(d) = d - d*(d) with frozen barycentric coords.
+    """
+
+    def __init__(self, prim, device="cuda"):
+        self.device = device
+
+        # Read bond topology from USD attributes
+        self.vertexBodyPath = prim.GetRelationship("vertexBody").GetTargets()[0] if prim.GetRelationship("vertexBody").GetTargets() else None
+        self.triBodyPath = prim.GetRelationship("triBody").GetTargets()[0] if prim.GetRelationship("triBody").GetTargets() else None
+
+        self.vertexIds = list(prim.GetAttribute("vertexIds").Get() or [])
+        triIds = prim.GetAttribute("triIds").Get()
+        self.triIds = list(np.array(triIds).ravel()) if triIds is not None else []
+
+        triBar = prim.GetAttribute("triBar").Get()
+        self.triBar = list(triBar) if triBar is not None else []
+
+        restGap = prim.GetAttribute("restGap").Get()
+        self.restGap = list(restGap) if restGap is not None else []
+
+        self.numBonds = len(self.vertexIds)
+
+        # Curve parameters (with defaults matching C++ InterDeformUnifiedDistanceConstraint)
+        self.dContact = float(prim.GetAttribute("param:dContact").Get() or 0.0003)
+        self.dRest = float(prim.GetAttribute("param:dRest").Get() or 0.0015)
+        self.dNeutralStart = float(prim.GetAttribute("param:dNeutralStart").Get() or 0.003)
+        self.breakRatio = float(prim.GetAttribute("param:breakRatio").Get() or 3.0)
+        self.stretchAbsMin = float(prim.GetAttribute("param:stretchAbsMin").Get() or 0.005)
+        self.alpha = float(prim.GetAttribute("param:alpha").Get() or 1e-5)
+
+
 class SimModelDO():
 
-    def __init__(self, stage, numEnvs, device, 
+    def __init__(self, stage, numEnvs, device,
                  simSubsteps=8,
                  simFrameRate=60,
                  simConstraintsSteps=1,
@@ -838,6 +876,13 @@ class SimModelDO():
                  globalConnectorMassWeightRatio=0.75,
                  globalConnectorKs=0.125,
                  globalConnectorRestLengthMul=0.02,
+                 # Adhesion parameters (UnifiedDistanceConstraint)
+                 globalAdhesionDContact=0.0003,
+                 globalAdhesionDRest=0.0015,
+                 globalAdhesionDNeutralStart=0.003,
+                 globalAdhesionBreakRatio=3.0,
+                 globalAdhesionStretchAbsMin=0.005,
+                 globalAdhesionAlpha=1e-5,
                  workspaceLow=[-1e5, -1e5, -1e5],
                  workspaceHigh=[1e5, 1e5, 1e5],
                  startingBoxLow=[-1e5, -1e5, -1e5],
@@ -867,9 +912,12 @@ class SimModelDO():
             self.velocityDampening = environmentVelocityDampening
             self.groundLevel = environmentGroundLevel
             self.globalKsDistance = globalKsDistance
-            self.globalDistanceCompliance = globalKsDistance / (self.simDt * self.simDt)
+            # XPBD compliance α̃ = α/dt². α̃=0 → infinitely stiff (PBD kS=1).
+            # α = 1/stiffness. Higher kS → stiffer → smaller compliance.
+            # Map kS ∈ (0,1] → α̃: when kS=1, α̃≈0 (rigid); when kS→0, α̃→large (soft).
+            self.globalDistanceCompliance = (1.0 - min(globalKsDistance, 0.999)) / (self.simDt * self.simDt)
             self.globalKsVolume = globalKsVolume
-            self.globalVolumeCompliance = globalKsVolume / (self.simDt * self.simDt)
+            self.globalVolumeCompliance = (1.0 - min(globalKsVolume, 0.999)) / (self.simDt * self.simDt)
             self.globalKsContact = globalKsContact
             self.globalKsDrag = globalKsDrag
             self.globalVolumeComplianceNeoHookean = globalVolumeCompliance
@@ -896,6 +944,14 @@ class SimModelDO():
             self.globalConnectorKs = globalConnectorKs
             self.globalConnectorRestLengthMul = globalConnectorRestLengthMul
 
+            # Adhesion parameters (UnifiedDistanceConstraint curve)
+            self.globalAdhesionDContact = globalAdhesionDContact
+            self.globalAdhesionDRest = globalAdhesionDRest
+            self.globalAdhesionDNeutralStart = globalAdhesionDNeutralStart
+            self.globalAdhesionBreakRatio = globalAdhesionBreakRatio
+            self.globalAdhesionStretchAbsMin = globalAdhesionStretchAbsMin
+            self.globalAdhesionAlpha = globalAdhesionAlpha
+
             with wp.ScopedTimer("Setup SimEnvs", active=debugTimes, detailed=False):
                 self.simEnvironment = dk.SimEnvironmentDO(self.stage, self.device, 0, globalLaparoscopeDragLookupRadius=self.globalLaparoscopeDragLookupRadius)
 
@@ -919,6 +975,11 @@ class SimModelDO():
             connectorTriangles = []
             connectorTriBar = []
             connectorRestDist = []
+
+            adhesionVertexIds = []
+            adhesionTriIds = []
+            adhesionTriBar = []
+            adhesionRestGap = []
 
             laparoscopeXForm = []
             laparoscopeBase = []
@@ -1042,6 +1103,18 @@ class SimModelDO():
                                 simConnectorTriangles = [x + currentVertices for x in simConnector.triIds]
                                 connectorTriangles += simConnectorTriangles
 
+                        for k in range(len(self.simEnvironment.simAdhesions)):
+
+                            simAdhesion = self.simEnvironment.simAdhesions[k]
+
+                            if(simMesh.path == simAdhesion.vertexBodyPath):
+                                simAdhesionVertexIds = [x + currentVertices for x in simAdhesion.vertexIds]
+                                adhesionVertexIds += simAdhesionVertexIds
+
+                            if(simMesh.path == simAdhesion.triBodyPath):
+                                simAdhesionTriIds = [x + currentVertices for x in simAdhesion.triIds]
+                                adhesionTriIds += simAdhesionTriIds
+
                         triToEnv += [i] * simMesh.numTris
                         vertexToEnv += [i] * simMesh.numVertices
 
@@ -1068,6 +1141,13 @@ class SimModelDO():
                         connectorTriBar += list(simConnector.triBar)
                         connectorRestDist += list(simConnector.restDist)
 
+                    for j in range(len(self.simEnvironment.simAdhesions)):
+
+                        simAdhesion = self.simEnvironment.simAdhesions[j]
+
+                        adhesionTriBar += list(simAdhesion.triBar)
+                        adhesionRestGap += list(simAdhesion.restGap)
+
                     for j in range(len(self.simEnvironment.simLaparoscopes)):
 
                         simLaparoscope = self.simEnvironment.simLaparoscopes[j]
@@ -1078,8 +1158,13 @@ class SimModelDO():
                         laparoscopeHeight += simLaparoscope.laparoscopeHeight
                         laparoscopeRadius += simLaparoscope.laparoscopeRadius
 
-                        laparoscopeVisPoint += simLaparoscope.visPoint
+                        if isinstance(simLaparoscope.visPoint, np.ndarray):
+                            laparoscopeVisPoint += [tuple(v) for v in simLaparoscope.visPoint]
+                        else:
+                            laparoscopeVisPoint += simLaparoscope.visPoint
                         tmpVisFace = simLaparoscope.visFace
+                        if isinstance(tmpVisFace, np.ndarray):
+                            tmpVisFace = tmpVisFace.flatten().tolist()
                         laparoscopeVisFace += [x + currentLaparoscopeVisPoints for x in tmpVisFace]
 
                         laparoscopeVertexToXForm += [i * 7 + 6] * simLaparoscope.numRodVisPoint
@@ -1099,9 +1184,13 @@ class SimModelDO():
                             laparoscopeLeftClampColor = simLaparoscope.leftClampColor
                             laparoscopeRightClampColor = simLaparoscope.rightClampColor
 
-                            laparoscopeVisPointColors += [laparoscopeRodColor] * self.numRodVisPoint +\
-                                                         [laparoscopeLeftClampColor] * self.numLeftClampVisPoint +\
-                                                         [laparoscopeRightClampColor] * self.numRightClampVisPoint
+                            # Convert vec4 (RGBA) to vec3 (RGB) if needed
+                            def _to_rgb(c):
+                                return (float(c[0]), float(c[1]), float(c[2])) if len(c) > 3 else c
+
+                            laparoscopeVisPointColors += [_to_rgb(laparoscopeRodColor)] * self.numRodVisPoint +\
+                                                         [_to_rgb(laparoscopeLeftClampColor)] * self.numLeftClampVisPoint +\
+                                                         [_to_rgb(laparoscopeRightClampColor)] * self.numRightClampVisPoint
 
             # Create variables that will be the same for all envs
             objectId = 0
@@ -1231,11 +1320,61 @@ class SimModelDO():
                 self.edgeRestLength = wp.array(edgeRestLength, dtype=wp.float32, device=self.device)
                 self.edgeDP = wp.zeros(len(self.activeEdge), dtype=wp.vec3, device=self.device)
 
+                # XPBD: separate index arrays and lambda accumulators
+                edge_np = np.array(edge, dtype=np.int32)
+                n_edges = len(edge_np) // 2
+                self.edgeA = wp.array(edge_np[0::2].copy(), dtype=wp.int32, device=self.device)
+                self.edgeB = wp.array(edge_np[1::2].copy(), dtype=wp.int32, device=self.device)
+                self.edgeLambda = wp.zeros(n_edges, dtype=wp.float32, device=self.device)
+
+                tet_np = np.array(tetrahedron, dtype=np.int32)
+                n_tets = len(tet_np) // 4
+                self.tetrahedronA = wp.array(tet_np[0::4].copy(), dtype=wp.int32, device=self.device)
+                self.tetrahedronB = wp.array(tet_np[1::4].copy(), dtype=wp.int32, device=self.device)
+                self.tetrahedronC = wp.array(tet_np[2::4].copy(), dtype=wp.int32, device=self.device)
+                self.tetrahedronD = wp.array(tet_np[3::4].copy(), dtype=wp.int32, device=self.device)
+                self.volumeLambda = wp.zeros(n_tets, dtype=wp.float32, device=self.device)
+
                 # Connectors
                 self.connectorVertexId = wp.array(connectorPoints, dtype=wp.int32, device=self.device)
                 self.connectorTriangleId = wp.array(connectorTriangles, dtype=wp.int32, device=self.device)
                 self.connectorTriBar = wp.array(connectorTriBar, dtype=wp.vec3, device=self.device)
                 self.connectorRestDist = wp.array(connectorRestDist, dtype=wp.float32, device=self.device)
+
+                # Adhesion bonds (UnifiedDistanceConstraint)
+                self.numAdhesionBonds = len(adhesionVertexIds)
+                self.numAdhesionBondsPerEnv = len(adhesionVertexIds) // max(self.numEnvs, 1) if len(adhesionVertexIds) > 0 else 0
+                if self.numAdhesionBonds > 0:
+                    self.adhesionVertexId = wp.array(adhesionVertexIds, dtype=wp.int32, device=self.device)
+                    self.adhesionTriId = wp.array(adhesionTriIds, dtype=wp.int32, device=self.device)
+                    self.adhesionTriBar = wp.array(adhesionTriBar, dtype=wp.vec3, device=self.device)
+                    self.adhesionRestGap = wp.array(adhesionRestGap, dtype=wp.float32, device=self.device)
+                    self.adhesionActive = wp.array([1.0] * self.numAdhesionBonds, dtype=wp.float32, device=self.device)
+                    self.adhesionInitialActive = wp.array([1.0] * self.numAdhesionBonds, dtype=wp.float32, device=self.device)
+                    self.adhesionNormalCache = wp.zeros(self.numAdhesionBonds, dtype=wp.vec3, device=self.device)
+                    self.adhesionCacheValid = wp.zeros(self.numAdhesionBonds, dtype=wp.int32, device=self.device)
+                else:
+                    self.adhesionVertexId = None
+                    self.adhesionTriId = None
+                    self.adhesionTriBar = None
+                    self.adhesionRestGap = None
+                    self.adhesionActive = None
+                    self.adhesionInitialActive = None
+                    self.adhesionNormalCache = None
+                    self.adhesionCacheValid = None
+
+                # Rigid-deform adhesion bonds (rigid body point fixed, deformable triangle moves)
+                # These are created programmatically via createRigidAdhesionBondsProgrammatic()
+                self.numRigidAdhesionBonds = 0
+                self.numRigidAdhesionBondsPerEnv = 0
+                self.rigidAdhesionRigidPoint = None
+                self.rigidAdhesionTriId = None
+                self.rigidAdhesionTriBar = None
+                self.rigidAdhesionRestGap = None
+                self.rigidAdhesionActive = None
+                self.rigidAdhesionInitialActive = None
+                self.rigidAdhesionNormalCache = None
+                self.rigidAdhesionCacheValid = None
 
                 # Miscelanious
                 self.activeDragConstraint = wp.zeros(len(self.vertex), dtype=wp.float32, device=self.device)
@@ -1376,8 +1515,13 @@ class SimModelDO():
         for j in range(len(self.simEnvironment.simLaparoscopes)):
             simLaparoscope = self.simEnvironment.simLaparoscopes[j]
 
-            envVisPoint += simLaparoscope.visPoint
+            if isinstance(simLaparoscope.visPoint, np.ndarray):
+                envVisPoint += [tuple(v) for v in simLaparoscope.visPoint]
+            else:
+                envVisPoint += simLaparoscope.visPoint
             laparoVisFace = simLaparoscope.visFace
+            if isinstance(laparoVisFace, np.ndarray):
+                laparoVisFace = laparoVisFace.flatten().tolist()
             simVisFace = [x + currentVisPoints for x in laparoVisFace]
             envVisFace += simVisFace
             currentVisPoints = len(envVisPoint)
@@ -1712,9 +1856,174 @@ class SimModelDO():
             laparoscopeVertexOffset = i * self.numEnvLaparoscopeVisPoints
             wp.copy(self.allVisPoint, self.allVisPointInitial, dest_offset=laparoscopeVertexOffset, src_offset=laparoscopeVertexOffset, count=self.numEnvLaparoscopeVisPoints)
 
+            # Reset adhesion bonds for this environment
+            if self.numAdhesionBonds > 0 and self.numAdhesionBondsPerEnv > 0:
+                adhesionOffset = i * self.numAdhesionBondsPerEnv
+                wp.copy(self.adhesionActive, self.adhesionInitialActive,
+                        dest_offset=adhesionOffset, src_offset=adhesionOffset,
+                        count=self.numAdhesionBondsPerEnv)
+
+            # Reset rigid-deform adhesion bonds for this environment
+            if self.numRigidAdhesionBonds > 0 and self.numRigidAdhesionBondsPerEnv > 0:
+                rigidAdhOffset = i * self.numRigidAdhesionBondsPerEnv
+                wp.copy(self.rigidAdhesionActive, self.rigidAdhesionInitialActive,
+                        dest_offset=rigidAdhOffset, src_offset=rigidAdhOffset,
+                        count=self.numRigidAdhesionBondsPerEnv)
+
         # Needs to run, otherwise laparoscope parts are overlapped in 0, 0, 0 coords. and BVH is problematic
         self.transformSimLaparoscopeMeshData()
         self.transformSimMeshData()
+
+    def getAdhesionActiveTensor(self):
+        """Get adhesion active states as PyTorch tensor, shape (numEnvs, bondsPerEnv)."""
+        if self.numAdhesionBonds == 0:
+            return None
+        import torch
+        activeTensor = wp.to_torch(self.adhesionActive)
+        return activeTensor.view(self.numEnvs, self.numAdhesionBondsPerEnv)
+
+    def getAdhesionActiveCounts(self):
+        """Get count of active bonds per environment as PyTorch tensor, shape (numEnvs,)."""
+        if self.numAdhesionBonds == 0:
+            return None
+        import torch
+        activeTensor = wp.to_torch(self.adhesionActive)
+        return activeTensor.view(self.numEnvs, self.numAdhesionBondsPerEnv).sum(dim=1)
+
+    def createAdhesionBondsProgrammatic(self, vertexIds, triIds, triBar=None, restGap=None):
+        """
+        Create adhesion bonds programmatically (without USD).
+
+        Args:
+            vertexIds: list of vertex indices (per env, will be replicated for all envs)
+            triIds: list of triangle vertex indices (3 per bond, flat, per env)
+            triBar: optional list of barycentric coords (wp.vec3 per bond).
+                    If None, computed from vertex positions via initAdhesionBondsKernel.
+            restGap: optional list of rest distances (float per bond).
+                     If None, computed from vertex positions.
+
+        Bond arrays are replicated across all environments with proper index offsets.
+        """
+        from FF_SRL.adhesion import initAdhesionBondsKernel
+
+        numBondsPerEnv = len(vertexIds)
+
+        # Replicate across environments with vertex offset
+        allVertexIds = []
+        allTriIds = []
+        for i in range(self.numEnvs):
+            offset = i * self.numEnvAllVertices
+            allVertexIds += [v + offset for v in vertexIds]
+            allTriIds += [t + offset for t in triIds]
+
+        totalBonds = numBondsPerEnv * self.numEnvs
+
+        self.numAdhesionBonds = totalBonds
+        self.numAdhesionBondsPerEnv = numBondsPerEnv
+
+        self.adhesionVertexId = wp.array(allVertexIds, dtype=wp.int32, device=self.device)
+        self.adhesionTriId = wp.array(allTriIds, dtype=wp.int32, device=self.device)
+
+        if triBar is not None and restGap is not None:
+            # Use provided values, replicate across envs
+            allTriBar = triBar * self.numEnvs
+            allRestGap = restGap * self.numEnvs
+            self.adhesionTriBar = wp.array(allTriBar, dtype=wp.vec3, device=self.device)
+            self.adhesionRestGap = wp.array(allRestGap, dtype=wp.float32, device=self.device)
+        else:
+            # Compute from vertex positions
+            self.adhesionTriBar = wp.zeros(totalBonds, dtype=wp.vec3, device=self.device)
+            self.adhesionRestGap = wp.zeros(totalBonds, dtype=wp.float32, device=self.device)
+
+            wp.launch(kernel=initAdhesionBondsKernel,
+                      dim=totalBonds,
+                      inputs=[self.vertex,
+                              self.adhesionVertexId,
+                              self.adhesionTriId,
+                              self.adhesionTriBar,
+                              self.adhesionRestGap],
+                      device=self.device)
+
+        self.adhesionActive = wp.array([1.0] * totalBonds, dtype=wp.float32, device=self.device)
+        self.adhesionInitialActive = wp.array([1.0] * totalBonds, dtype=wp.float32, device=self.device)
+        self.adhesionNormalCache = wp.zeros(totalBonds, dtype=wp.vec3, device=self.device)
+        self.adhesionCacheValid = wp.zeros(totalBonds, dtype=wp.int32, device=self.device)
+
+        print(f"Created {totalBonds} adhesion bonds ({numBondsPerEnv} per env, {self.numEnvs} envs)")
+
+    def createRigidAdhesionBondsProgrammatic(self, rigidPoints, triIds, triBar=None, restGap=None):
+        """
+        Create rigid-deform adhesion bonds programmatically.
+
+        Args:
+            rigidPoints: list of wp.vec3 - fixed world-space points on rigid body (1 per bond, per env)
+            triIds: list of triangle vertex indices on deformable mesh (3 per bond, flat, per env)
+            triBar: optional list of barycentric coords (wp.vec3 per bond).
+                    If None, computed from vertex positions via initRigidAdhesionBondsKernel.
+            restGap: optional list of rest distances (float per bond).
+                     If None, computed from vertex positions.
+
+        Bond arrays are replicated across all environments with proper index offsets.
+        """
+        from FF_SRL.adhesion import initRigidAdhesionBondsKernel
+
+        numBondsPerEnv = len(rigidPoints)
+
+        allRigidPoints = []
+        allTriIds = []
+        for i in range(self.numEnvs):
+            offset = i * self.numEnvAllVertices
+            allRigidPoints += rigidPoints  # rigid points don't need offset (world-space, same per env)
+            allTriIds += [x + offset for x in triIds]
+
+        totalBonds = numBondsPerEnv * self.numEnvs
+
+        self.numRigidAdhesionBonds = totalBonds
+        self.numRigidAdhesionBondsPerEnv = numBondsPerEnv
+
+        self.rigidAdhesionRigidPoint = wp.array(allRigidPoints, dtype=wp.vec3, device=self.device)
+        self.rigidAdhesionTriId = wp.array(allTriIds, dtype=wp.int32, device=self.device)
+
+        if triBar is not None and restGap is not None:
+            allTriBar = triBar * self.numEnvs
+            allRestGap = restGap * self.numEnvs
+            self.rigidAdhesionTriBar = wp.array(allTriBar, dtype=wp.vec3, device=self.device)
+            self.rigidAdhesionRestGap = wp.array(allRestGap, dtype=wp.float32, device=self.device)
+        else:
+            self.rigidAdhesionTriBar = wp.zeros(totalBonds, dtype=wp.vec3, device=self.device)
+            self.rigidAdhesionRestGap = wp.zeros(totalBonds, dtype=wp.float32, device=self.device)
+
+            wp.launch(kernel=initRigidAdhesionBondsKernel,
+                      dim=totalBonds,
+                      inputs=[self.vertex,
+                              self.rigidAdhesionRigidPoint,
+                              self.rigidAdhesionTriId,
+                              self.rigidAdhesionTriBar,
+                              self.rigidAdhesionRestGap],
+                      device=self.device)
+
+        self.rigidAdhesionActive = wp.array([1.0] * totalBonds, dtype=wp.float32, device=self.device)
+        self.rigidAdhesionInitialActive = wp.array([1.0] * totalBonds, dtype=wp.float32, device=self.device)
+        self.rigidAdhesionNormalCache = wp.zeros(totalBonds, dtype=wp.vec3, device=self.device)
+        self.rigidAdhesionCacheValid = wp.zeros(totalBonds, dtype=wp.int32, device=self.device)
+
+        print(f"Created {totalBonds} rigid-deform adhesion bonds ({numBondsPerEnv} per env, {self.numEnvs} envs)")
+
+    def getRigidAdhesionActiveTensor(self):
+        """Get rigid adhesion active states as PyTorch tensor, shape (numEnvs, bondsPerEnv)."""
+        if self.numRigidAdhesionBonds == 0:
+            return None
+        import torch
+        activeTensor = wp.to_torch(self.rigidAdhesionActive)
+        return activeTensor.view(self.numEnvs, self.numRigidAdhesionBondsPerEnv)
+
+    def getRigidAdhesionActiveCounts(self):
+        """Get count of active rigid-deform bonds per environment as PyTorch tensor, shape (numEnvs,)."""
+        if self.numRigidAdhesionBonds == 0:
+            return None
+        import torch
+        activeTensor = wp.to_torch(self.rigidAdhesionActive)
+        return activeTensor.view(self.numEnvs, self.numRigidAdhesionBondsPerEnv).sum(dim=1)
 
     def resetStochasticModel(self, laparoscopeTranslation, laparoscopeRotation):
         # reset meshes
@@ -1747,6 +2056,7 @@ class SimEnvironmentDO():
         self.simMeshes = []
         self.simLockBoxes = []
         self.simConnectors = []
+        self.simAdhesions = []
         self.simLaparoscopes = []
         self.simRigids = []
         self.envNumber = envNumber
@@ -1758,34 +2068,39 @@ class SimEnvironmentDO():
         meshes = [x for x in self.stage.Traverse() if x.IsA(UsdGeom.Mesh) and x.GetAttribute("simMesh").Get() == True]
         lockBoxes = [x for x in self.stage.Traverse() if x.IsA(UsdGeom.Cube) and x.GetAttribute("simLockBox").Get() == True]
         connectors = [x for x in self.stage.Traverse() if x.IsA(UsdGeom.Xform) and x.GetAttribute("simConnector").Get() == True]
+        adhesions = [x for x in self.stage.Traverse() if x.IsA(UsdGeom.Xform) and x.GetAttribute("simAdhesion").Get() == True]
         laparoscopes = [x for x in self.stage.Traverse() if x.IsA(UsdGeom.Xform) and x.GetAttribute("simLaparoscope").Get() == True]
         rigids = [x for x in self.stage.Traverse() if x.IsA(UsdGeom.Mesh) and x.GetAttribute("simRigid").Get() == True]
-    
+
         for mesh in meshes:
             simMesh = dk.SimMeshDO(mesh, device)
             self.simMeshes.append(simMesh)
             self.environmentNumVertices += simMesh.numVertices
-        
+
         for lockBox in lockBoxes:
             simLockBox = dk.SimLockBoxDO(lockBox, device)
             self.simLockBoxes.append(simLockBox)
-    
+
         for connector in connectors:
             simConnector = dk.SimConnectorDO(connector, device)
             self.simConnectors.append(simConnector)
-    
+
+        for adhesion in adhesions:
+            simAdhesion = SimAdhesionDO(adhesion, device)
+            self.simAdhesions.append(simAdhesion)
+
         for laparoscope in laparoscopes:
             simLaparoscope = dk.SimLaparoscopeDO(laparoscope, device, self.stage, laparoscopeDragLookupRadius = self.globalLaparoscopeDragLookupRadius)
             self.simLaparoscopes.append(simLaparoscope)
-    
+
         for rigid in rigids:
             simRigid = dk.SimRigidDO(rigid, device)
             self.simRigids.append(simRigid)
 
         for simMesh in self.simMeshes:
- 
+
             for simLockBox in self.simLockBoxes:
-                
+
                 simLockBox.lockArray(simMesh.vertex, simMesh.inverseMass)
 
     def duplicateMeshes(self, spacingX:float, spacingZ:float):
