@@ -1769,6 +1769,62 @@ class SimModelDO():
         # Need to apply twice to check for dragging
         self.applyActions(wp.from_torch(actions))
          
+    def forceLaparoscopeClampRegion(self, centerVertexId: int, radius: float, envs, on: float = 1.0, animate: bool = True):
+        """Grab all vertices within `radius` (cm) of centerVertexId."""
+        verts = self.vertex.numpy()
+        inv_mass = self.inverseMass.numpy()
+        center_pos = verts[centerVertexId]
+
+        # Find all free vertices within radius (single-env indices)
+        n_env_verts = self.numEnvAllVertices
+        grabbed = []
+        for i in range(n_env_verts):
+            if inv_mass[i] == 0.0:
+                continue
+            dist = np.linalg.norm(verts[i] - center_pos)
+            if dist <= radius:
+                grabbed.append(i)
+
+        print(f"  forceLaparoscopeClampRegion: {len(grabbed)} vertices within {radius:.2f}cm of vertex {centerVertexId}")
+
+        # Set drag constraint for each grabbed vertex in each env
+        envIds = torch.nonzero(envs).to(dtype=torch.int32).flatten()
+        envIds_wp = wp.from_torch(envIds)
+        for vid in grabbed:
+            wp.launch(kernel=forceClampsDragKernel,
+                      dim=len(envIds_wp),
+                      inputs=[self.activeDragConstraint,
+                              vid,
+                              envIds_wp,
+                              on,
+                              self.environmentNumVertices],
+                      device=self.device)
+
+        if animate:
+            action = torch.tensor([0., 0., 0., 0., -1.], dtype=torch.float, device=self.device)
+            actions = action.repeat(self.numEnvs, 1) * torch.transpose(envs.repeat(5, 1), 0, 1)
+            actions = actions.flatten()
+            actions = wp.from_torch(actions)
+
+            wp.launch(kernel=applyActionsKernel,
+                      dim=len(self.laparoscopeXForm),
+                      inputs=[self.laparoscopeXForm,
+                              actions,
+                              self.laparoscopeDragCutHeat,
+                              self.laparoscopeDragCutHeatUpdate],
+                      device=self.device)
+
+            wp.launch(kernel=updateLaparoscopeKernel,
+                      dim=4 * self.numEnvs,
+                      inputs=[self.laparoscopeXForm,
+                              self.laparoscopeTip,
+                              self.laparoscopeBase,
+                              self.laparoscopeRadius,
+                              self.laparoscopeHeight],
+                      device=self.device)
+
+        return grabbed
+
     def forceLaparoscopeClampVertex(self, vertexId:int, envs, on:float=1.0, animate:bool=True):
         envIds = torch.nonzero(envs).to(dtype=torch.int32).flatten()
         envIds = wp.from_torch(envIds)
