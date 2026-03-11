@@ -2009,6 +2009,76 @@ class SimModelDO():
 
         print(f"Created {totalBonds} rigid-deform adhesion bonds ({numBondsPerEnv} per env, {self.numEnvs} envs)")
 
+    def createRigidAdhesionFromMeshes(self, bondDistance=3.5):
+        """
+        Auto-create rigid-deform adhesion bonds between rigid body (bone) surface
+        and deformable mesh (tumor) surface triangles.
+
+        Algorithm (matching xpbd-tissue-sim Simulation.cpp):
+          1. Get bone surface vertices (rigid body)
+          2. For each tumor surface triangle, compute centroid
+          3. Find closest bone vertex to each centroid
+          4. If distance < bondDistance, create a bond:
+             - rigidPoint = closest bone surface vertex (world space, fixed)
+             - triIds = tumor triangle vertex indices (deformable)
+
+        Args:
+            bondDistance: maximum distance (cm) for bond creation.
+                         Default 3.5cm (= 35mm, matching xpbd-tissue-sim's 0.0348m)
+        """
+        import numpy as np
+        from scipy.spatial import cKDTree
+
+        # Get rigid body vertices (bone surface)
+        rigidVerts = []
+        for simRigid in self.simEnvironment.simRigids:
+            rigidVerts.append(np.array(simRigid.vertex))
+        if len(rigidVerts) == 0:
+            print("No rigid bodies found, skipping rigid-deform adhesion creation")
+            return
+        rigidVerts = np.vstack(rigidVerts)
+
+        # Get deformable mesh surface triangles (tumor)
+        # Use first env's vertex positions and triangle indices
+        simMesh = self.simEnvironment.simMeshes[0]
+        tumorVerts = np.array(simMesh.vertex)
+        tumorTriIndices = np.array(simMesh.triangle).reshape(-1, 3)  # surface tri indices
+
+        print(f"  Rigid (bone) vertices: {len(rigidVerts)}")
+        print(f"  Deformable (tumor) surface triangles: {len(tumorTriIndices)}")
+        print(f"  Bond distance threshold: {bondDistance:.2f} cm")
+
+        # Build KD-tree on bone vertices for fast nearest-neighbor lookup
+        tree = cKDTree(rigidVerts)
+
+        # For each tumor surface triangle, find closest bone point
+        bondRigidPoints = []  # wp.vec3 list
+        bondTriIds = []       # flat list of 3 vertex indices per bond
+
+        for tri in tumorTriIndices:
+            # Triangle centroid
+            centroid = tumorVerts[tri].mean(axis=0)
+
+            # Query closest bone vertex
+            dist, idx = tree.query(centroid)
+
+            if dist < bondDistance:
+                bonePoint = rigidVerts[idx]
+                bondRigidPoints.append(tuple(bonePoint))
+                bondTriIds.extend(tri.tolist())
+
+        numBonds = len(bondRigidPoints)
+        if numBonds == 0:
+            print(f"  WARNING: No bonds created! Increase bondDistance (current={bondDistance:.2f}cm)")
+            print(f"  Tumor bbox: {tumorVerts.min(0)} -> {tumorVerts.max(0)}")
+            print(f"  Bone bbox: {rigidVerts.min(0)} -> {rigidVerts.max(0)}")
+            return
+
+        print(f"  Created {numBonds} bonds out of {len(tumorTriIndices)} triangles")
+
+        # Use existing programmatic API (handles multi-env replication + GPU init)
+        self.createRigidAdhesionBondsProgrammatic(bondRigidPoints, bondTriIds)
+
     def getRigidAdhesionActiveTensor(self):
         """Get rigid adhesion active states as PyTorch tensor, shape (numEnvs, bondsPerEnv)."""
         if self.numRigidAdhesionBonds == 0:

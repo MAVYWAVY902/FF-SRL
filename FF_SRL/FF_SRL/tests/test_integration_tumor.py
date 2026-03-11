@@ -42,18 +42,29 @@ def test_load_scene():
         globalKsDrag=1.0,
         globalLaparoscopeDragLookupRadius=0.5,  # 5mm = 0.5cm
         environmentGroundLevel=-100.0,  # far below scene so it doesn't interfere
+        # Adhesion parameters (cm units, converted from xpbd-tissue-sim's meters)
+        globalAdhesionDContact=0.03,       # 0.3mm = 0.03cm
+        globalAdhesionDRest=0.32,          # 3.2mm = 0.32cm
+        globalAdhesionDNeutralStart=0.5,   # 5mm = 0.5cm
+        globalAdhesionBreakRatio=1.27,     # 27% strain
+        globalAdhesionStretchAbsMin=0.5,   # 5mm = 0.5cm
+        globalAdhesionAlpha=1e-7,          # very stiff
     )
 
     print(f"  Vertices: {simModel.numVertices}")
     print(f"  Tetrahedra: {simModel.numTetrahedrons}")
     print(f"  Edges: {simModel.numEdges}")
     print(f"  Triangles: {simModel.numTriangles}")
+    # Create rigid-deform adhesion bonds (tumor triangles <-> bone surface)
+    simModel.createRigidAdhesionFromMeshes(bondDistance=3.5)  # 3.5cm = 35mm
+
     print(f"  Adhesion bonds: {simModel.numAdhesionBonds}")
     print(f"  Rigid adhesion bonds: {simModel.numRigidAdhesionBonds}")
 
     assert simModel.numVertices > 0, "No vertices loaded"
     assert simModel.numTetrahedrons > 0, "No tetrahedra loaded"
     assert simModel.numEdges > 0, "No edges loaded"
+    assert simModel.numRigidAdhesionBonds > 0, "No rigid adhesion bonds created"
 
     print("  PASSED")
     return simModel
@@ -184,11 +195,20 @@ def test_multi_env():
         globalKsDistance=1.0,
         globalKsVolume=1.0,
         globalKsDrag=1.0,
-        globalLaparoscopeDragLookupRadius=0.005,
-        environmentGroundLevel=-1.0,
+        globalLaparoscopeDragLookupRadius=0.5,
+        environmentGroundLevel=-100.0,
+        globalAdhesionDContact=0.03,
+        globalAdhesionDRest=0.32,
+        globalAdhesionDNeutralStart=0.5,
+        globalAdhesionBreakRatio=1.27,
+        globalAdhesionStretchAbsMin=0.5,
+        globalAdhesionAlpha=1e-7,
     )
 
+    simModel.createRigidAdhesionFromMeshes(bondDistance=3.5)
+
     print(f"  Total vertices (2 envs): {simModel.numVertices}")
+    print(f"  Rigid adhesion bonds: {simModel.numRigidAdhesionBonds}")
     assert simModel.numVertices > 0
 
     simIntegrator = dk.SimIntegratorDO(DEVICE)
