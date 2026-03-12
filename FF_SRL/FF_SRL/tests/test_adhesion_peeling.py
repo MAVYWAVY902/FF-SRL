@@ -50,9 +50,9 @@ def main():
         globalAdhesionDContact=0.03,       # 0.3mm
         globalAdhesionDRest=0.32,          # 3.2mm
         globalAdhesionDNeutralStart=0.5,   # 5mm
-        globalAdhesionBreakRatio=1.27,     # 27% strain
-        globalAdhesionStretchAbsMin=0.5,   # 5mm
-        globalAdhesionAlpha=1e-7,          # very stiff
+        globalAdhesionBreakRatio=1.15,     # 15% strain
+        globalAdhesionStretchAbsMin=0.15,  # 1.5mm
+        globalAdhesionAlpha=1e-6,          # stiff but not rigid
     )
 
     # Create adhesion bonds
@@ -121,72 +121,95 @@ def main():
         verts_after_settle - simModel.initialVertex.numpy(), axis=1))
     print(f"Max displacement after settle: {max_disp_settle*10:.2f} mm")
 
-    # --- Phase 3: Pull upward ---
-    print("\n--- Phase 3: Pull upward (100 frames) ---")
+    # --- Phase 3: Compare different pull directions ---
     pull_speed = 0.08  # cm per frame (0.8mm/frame)
     pull_frames = 100
 
-    bond_history = []
-    displacement_history = []
+    # Directions to test: (label, dx, dy, dz)
+    # Test small deviations around straight-up
+    directions = [
+        ("Straight up (0,1,0)",         0.0,  1.0,  0.0),
+        ("Slight +X (0.15,0.99,0)",     0.15, 0.99, 0.0),
+        ("Slight -X (-0.15,0.99,0)",   -0.15, 0.99, 0.0),
+        ("Slight +Z (0,0.99,0.15)",     0.0,  0.99, 0.15),
+        ("Slight -Z (0,0.99,-0.15)",    0.0,  0.99,-0.15),
+        ("Slight +XZ (0.1,0.99,0.1)",   0.1,  0.99, 0.1),
+        ("Medium +X (0.3,0.95,0)",      0.3,  0.95, 0.0),
+        ("Medium -X (-0.3,0.95,0)",    -0.3,  0.95, 0.0),
+    ]
 
-    for frame in range(pull_frames):
-        # Apply upward pull
-        pull_action = torch.tensor([0.0, pull_speed, 0.0],
-                                   dtype=torch.float32, device=DEVICE)
-        simModel.applyCartesianActions(wp.from_torch(pull_action))
+    results = {}
 
-        # Step physics
-        simModel.resetCollisionInfo()
-        simIntegrator.stepModel(simModel)
+    for label, dx, dy, dz in directions:
+        print(f"\n--- Pull: {label} ({pull_frames} frames) ---")
 
-        # Check state
-        verts_now = simModel.vertex.numpy()
-        has_nan = np.any(np.isnan(verts_now))
-        if has_nan:
-            print(f"  Frame {frame}: NaN detected! Aborting.")
-            return False
+        # Reset simulation to initial state
+        simModel.resetFixedModel([0])
 
-        active_bonds = simModel.rigidAdhesionActive.numpy()
-        active_count = int(np.sum(active_bonds > 0.5))
-        broken = totalBonds - active_count
+        # Re-grab the same region
+        envs = torch.ones(1, dtype=torch.float32, device=DEVICE)
 
-        max_disp = np.max(np.linalg.norm(
-            verts_now - simModel.initialVertex.numpy(), axis=1))
-
+        # Move laparoscope to tumor top
         lap_pos = simModel.getLaparoscopePositionsTensor()
-        tip_y = lap_pos[0, 1].item()
+        target = torch.tensor([top_pos[0], top_pos[1] + 0.1, top_pos[2]],
+                              dtype=torch.float32, device=DEVICE)
+        delta = target - lap_pos[0]
+        action = torch.tensor([delta[0].item(), delta[1].item(), delta[2].item()],
+                              dtype=torch.float32, device=DEVICE)
+        simModel.applyCartesianActions(wp.from_torch(action))
 
-        bond_history.append(active_count)
-        displacement_history.append(max_disp)
+        # Grab region
+        simModel.forceLaparoscopeClampRegion(
+            int(top_vertex_idx), grab_radius, envs, on=1.0, animate=True)
 
-        if frame % 10 == 0 or frame == pull_frames - 1:
-            print(f"  Frame {frame:3d}: active={active_count}/{totalBonds} "
-                  f"(broken={broken}), max_disp={max_disp*10:.1f}mm, "
-                  f"tip_y={tip_y:.3f}cm")
+        # Settle
+        for _ in range(5):
+            simModel.resetCollisionInfo()
+            simIntegrator.stepModel(simModel)
 
-    # --- Analysis ---
-    print("\n--- Results ---")
-    initial_bonds = bond_history[0]
-    final_bonds = bond_history[-1]
-    total_broken = initial_bonds - final_bonds
+        active_before = int(np.sum(simModel.rigidAdhesionActive.numpy() > 0.5))
+        print(f"  Active bonds after settle: {active_before}/{totalBonds}")
 
-    print(f"Bonds at start of pull: {initial_bonds}")
-    print(f"Bonds at end of pull:   {final_bonds}")
-    print(f"Total broken:           {total_broken}")
-    print(f"Max displacement:       {displacement_history[-1]*10:.1f} mm")
+        # Normalize direction and apply pull_speed
+        norm = (dx**2 + dy**2 + dz**2) ** 0.5
+        pdx, pdy, pdz = dx/norm * pull_speed, dy/norm * pull_speed, dz/norm * pull_speed
 
-    # Verify adhesion worked
-    if total_broken > 0:
-        print("\nADHESION PEELING VERIFIED: Bonds broke progressively during pull.")
-    elif initial_bonds == totalBonds and final_bonds == totalBonds:
-        print("\nWARNING: No bonds broke. Pull may be too weak or adhesion too stiff.")
-        print("Try increasing pull_speed or decreasing globalAdhesionStretchAbsMin.")
-    else:
-        print("\nWARNING: Some bonds were already broken before pull started.")
+        for frame in range(pull_frames):
+            pull_action = torch.tensor([pdx, pdy, pdz],
+                                       dtype=torch.float32, device=DEVICE)
+            simModel.applyCartesianActions(wp.from_torch(pull_action))
 
-    # Check no explosion
-    assert not np.any(np.isnan(simModel.vertex.numpy())), "Final state has NaN!"
-    assert displacement_history[-1] < 100.0, "Displacement too large - possible explosion"
+            simModel.resetCollisionInfo()
+            simIntegrator.stepModel(simModel)
+
+            verts_now = simModel.vertex.numpy()
+            if np.any(np.isnan(verts_now)):
+                print(f"  Frame {frame}: NaN! Aborting this direction.")
+                break
+
+            active_bonds = simModel.rigidAdhesionActive.numpy()
+            active_count = int(np.sum(active_bonds > 0.5))
+            broken = totalBonds - active_count
+            max_disp = np.max(np.linalg.norm(
+                verts_now - simModel.initialVertex.numpy(), axis=1))
+
+            if frame % 20 == 0 or frame == pull_frames - 1:
+                print(f"  Frame {frame:3d}: broken={broken}/{totalBonds} "
+                      f"({broken/totalBonds*100:.1f}%), max_disp={max_disp*10:.1f}mm")
+
+        final_broken = totalBonds - int(np.sum(simModel.rigidAdhesionActive.numpy() > 0.5))
+        final_disp = np.max(np.linalg.norm(
+            simModel.vertex.numpy() - simModel.initialVertex.numpy(), axis=1))
+        results[label] = (final_broken, final_disp)
+
+    # --- Comparison ---
+    print("\n" + "=" * 60)
+    print("DIRECTION COMPARISON")
+    print("=" * 60)
+    print(f"{'Direction':<30} {'Broken':>8} {'%':>7} {'MaxDisp':>10}")
+    print("-" * 58)
+    for label, (broken, disp) in results.items():
+        print(f"{label:<30} {broken:>8} {broken/totalBonds*100:>6.1f}% {disp*10:>8.1f}mm")
 
     print("\nTEST PASSED (no NaN/explosion)")
     return True

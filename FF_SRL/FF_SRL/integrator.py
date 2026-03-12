@@ -27,13 +27,32 @@ def PBDStep(vertex: wp.array(dtype=wp.vec3),
             predictedVertex: wp.array(dtype=wp.vec3),
             velocity: wp.array(dtype=wp.vec3),
             dT: float):
-    
+
     tid = wp.tid()
 
     x = vertex[tid]
     xPred = predictedVertex[tid]
 
     v = (xPred - x)*(1.0/dT)
+    x = xPred
+
+    vertex[tid] = x
+    velocity[tid] = v
+
+@wp.kernel
+def PBDStepDamped(vertex: wp.array(dtype=wp.vec3),
+                  predictedVertex: wp.array(dtype=wp.vec3),
+                  velocity: wp.array(dtype=wp.vec3),
+                  dT: float,
+                  damping: float):
+
+    tid = wp.tid()
+
+    x = vertex[tid]
+    xPred = predictedVertex[tid]
+
+    v = (xPred - x) * (1.0 / dT)
+    v = v * damping
     x = xPred
 
     vertex[tid] = x
@@ -413,11 +432,13 @@ def dragConstraints(predictedVertex: wp.array(dtype=wp.vec3),
 
 @wp.kernel
 def dragConstraintsDO(predictedVertex: wp.array(dtype=wp.vec3),
+                      dP: wp.array(dtype=wp.vec3),
+                      constraintsNumber: wp.array(dtype=int),
                       dragActive: wp.array(dtype=float),
                       vertexToEnv: wp.array(dtype=wp.int32),
                       laparoscopeInfo: wp.array(dtype = wp.vec3),
                       dragKs: float):
-    
+
     tid = wp.tid()
     drag = dragActive[tid]
     numEnv = vertexToEnv[tid]
@@ -426,7 +447,6 @@ def dragConstraintsDO(predictedVertex: wp.array(dtype=wp.vec3),
         return
 
     predictedPosition = predictedVertex[tid]
-    # laparoscopeDragPoint = laparoscopeInfo[numEnv * 4 + 3]
     # In DVRK we use right clamp end for dragging
     laparoscopeDragPoint = laparoscopeInfo[numEnv * 4 + 2]
 
@@ -440,8 +460,9 @@ def dragConstraintsDO(predictedVertex: wp.array(dtype=wp.vec3),
 
     edgeDP = len * wp.normalize(dir) * drag * dragKs / invMass
 
-    # wp.atomic_sub(predictedVertex, tid, edgeDP)
-    predictedVertex[tid] = predictedPosition - edgeDP
+    # Route through dP system so elastic constraints can compete
+    wp.atomic_sub(dP, tid, edgeDP)
+    wp.atomic_add(constraintsNumber, tid, 1)
 
 @wp.kernel
 def volumeConstraints(predictedVertex: wp.array(dtype=wp.vec3),
@@ -2067,6 +2088,19 @@ class SimIntegratorDO():
                                       simModel.simDt],
                               device=simModel.device)
 
+                # Drag constraint goes through dP system alongside elastic constraints
+                wp.launch(kernel=dragConstraintsDO,
+                          dim=len(simModel.predictedVertex),
+                          inputs=[simModel.predictedVertex,
+                                  simModel.dP,
+                                  simModel.constraintsNumber,
+                                  simModel.activeDragConstraint,
+                                  simModel.vertexToEnv,
+                                  simModel.laparoscopeTip,
+                                  simModel.globalKsDrag],
+                          device=simModel.device)
+
+                # Apply all constraints (elastic + drag) averaged together
                 wp.launch(kernel=applyConstraints,
                           dim=simModel.numVertices,
                           inputs=[simModel.predictedVertex,
@@ -2074,15 +2108,6 @@ class SimIntegratorDO():
                                   simModel.constraintsNumber],
                           device=simModel.device)
 
-                wp.launch(kernel=dragConstraintsDO,
-                          dim=len(simModel.predictedVertex),
-                          inputs=[simModel.predictedVertex,
-                                  simModel.activeDragConstraint,
-                                  simModel.vertexToEnv,
-                                  simModel.laparoscopeTip,
-                                  simModel.globalKsDrag],
-                          device=simModel.device)
-                
                 wp.launch(
                     kernel=triToPointDistanceConstraintsDO,
                     dim=simModel.simConnectors,
@@ -2120,14 +2145,25 @@ class SimIntegratorDO():
                               simModel.groundLevel],
                       device=simModel.device)
             
-            wp.launch(kernel=PBDStep,
-                      dim=len(simModel.vertex),
-                      inputs=[simModel.vertex,
-                              simModel.predictedVertex,
-                              simModel.velocity,
-                              simModel.simDt],
-                      device=simModel.device) 
-            
+            damping = getattr(simModel, 'velocityDamping', 1.0)
+            if damping < 1.0:
+                wp.launch(kernel=PBDStepDamped,
+                          dim=len(simModel.vertex),
+                          inputs=[simModel.vertex,
+                                  simModel.predictedVertex,
+                                  simModel.velocity,
+                                  simModel.simDt,
+                                  damping],
+                          device=simModel.device)
+            else:
+                wp.launch(kernel=PBDStep,
+                          dim=len(simModel.vertex),
+                          inputs=[simModel.vertex,
+                                  simModel.predictedVertex,
+                                  simModel.velocity,
+                                  simModel.simDt],
+                          device=simModel.device)
+
         simModel.transformSimMeshData()
         simModel.transformSimLaparoscopeMeshData()
 

@@ -910,6 +910,7 @@ class SimModelDO():
 
             self.gravity = wp.vec3(environmentGravity[0], environmentGravity[1], environmentGravity[2])
             self.velocityDampening = environmentVelocityDampening
+            self.velocityDamping = 1.0  # Per-substep velocity multiplier (1.0 = no damping, 0.99 = light, 0.95 = heavy)
             self.groundLevel = environmentGroundLevel
             self.globalKsDistance = globalKsDistance
             # XPBD compliance α̃ = α/dt². α̃=0 → infinitely stiff (PBD kS=1).
@@ -923,10 +924,11 @@ class SimModelDO():
             self.globalVolumeComplianceNeoHookean = globalVolumeCompliance
             self.gloabalDeviatoricComplianceNeoHookean = globalDeviatoricCompliance
             
-            # Stable Neo-Hookean material parameters (in Pascals)
-            # Default values for soft tissue: μ ≈ 1000 Pa, λ ≈ 5000 Pa
-            self.globalMu = 1000.0  # Shear modulus (Pa)
-            self.globalLambda = 5000.0  # First Lamé parameter (Pa)
+            # Stable Neo-Hookean material parameters
+            # Soft tissue: E=8e4 Pa, ν=0.45 → μ≈27.6kPa, λ≈248kPa
+            # Scaled for cm units with unit masses (×1e6/Pa from meter-based values)
+            self.globalMu = 1e7  # Shear modulus (cm-unit scaled)
+            self.globalLambda = 5e7  # First Lamé parameter (cm-unit scaled)
             self.useStableNH = True  # Set to True to enable Stable Neo-Hookean constraints
             
             self.globalLaparoscopeDragLookupRadius = globalLaparoscopeDragLookupRadius
