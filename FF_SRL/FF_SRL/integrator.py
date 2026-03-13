@@ -14,13 +14,101 @@ IN_DE_CREASE_STEPS = wp.constant(in_de_crease_steps)
 @wp.kernel
 def bounds(predictedVertex: wp.array(dtype=wp.vec3),
            groundLevel: float):
-    
+
     tid = wp.tid()
 
     x = predictedVertex[tid]
 
     if(x[1] < groundLevel):
         predictedVertex[tid] = wp.vec3(x[0], groundLevel, x[2])
+
+@wp.kernel
+def collideDeformableRigidMesh(
+    predictedVertex: wp.array(dtype=wp.vec3),
+    inverseMass: wp.array(dtype=wp.float32),
+    numDeformVerts: int,
+    rigidVertex: wp.array(dtype=wp.vec3),
+    rigidTriangle: wp.array(dtype=wp.int32),
+    numRigidTris: int,
+    collisionMargin: float):
+    """Push deformable vertices out of rigid mesh.
+
+    For each deformable vertex, brute-force check all rigid triangles.
+    If vertex is within collisionMargin of a triangle and on the wrong
+    side (penetrating), project it to the surface + margin.
+    """
+    tid = wp.tid()
+    if tid >= numDeformVerts:
+        return
+    if inverseMass[tid] == 0.0:
+        return
+
+    p = predictedVertex[tid]
+
+    min_dist = float(1e10)
+    best_closest = wp.vec3(0.0, 0.0, 0.0)
+    best_normal = wp.vec3(0.0, 1.0, 0.0)
+    found = int(0)
+
+    for i in range(numRigidTris):
+        i0 = rigidTriangle[i * 3]
+        i1 = rigidTriangle[i * 3 + 1]
+        i2 = rigidTriangle[i * 3 + 2]
+
+        a = rigidVertex[i0]
+        b = rigidVertex[i1]
+        c = rigidVertex[i2]
+
+        # Triangle normal
+        ab = b - a
+        ac = c - a
+        n = wp.cross(ab, ac)
+        n_len = wp.length(n)
+        if n_len < 1.0e-10:
+            continue
+        n = n / n_len
+
+        # Signed distance from point to triangle plane
+        ap = p - a
+        signed_dist = wp.dot(ap, n)
+
+        # Project point onto plane
+        proj = p - n * signed_dist
+
+        # Check if projection is inside triangle (barycentric)
+        v0 = c - a
+        v1 = b - a
+        v2 = proj - a
+
+        d00 = wp.dot(v0, v0)
+        d01 = wp.dot(v0, v1)
+        d02 = wp.dot(v0, v2)
+        d11 = wp.dot(v1, v1)
+        d12 = wp.dot(v1, v2)
+
+        denom = d00 * d11 - d01 * d01
+        if wp.abs(denom) < 1.0e-10:
+            continue
+        inv_denom = 1.0 / denom
+        u = (d11 * d02 - d01 * d12) * inv_denom
+        v = (d00 * d12 - d01 * d02) * inv_denom
+
+        # Inside triangle if u >= 0, v >= 0, u + v <= 1
+        if u >= -0.01 and v >= -0.01 and (u + v) <= 1.01:
+            dist = wp.abs(signed_dist)
+            if dist < min_dist:
+                min_dist = dist
+                best_closest = proj
+                best_normal = n
+                # Ensure normal points away from bone interior
+                # (outward = toward the deformable mesh side)
+                if signed_dist < 0.0:
+                    best_normal = -n
+                found = 1
+
+    # If penetrating or very close, push out
+    if found == 1 and min_dist < collisionMargin:
+        predictedVertex[tid] = best_closest + best_normal * collisionMargin
 
 @wp.kernel
 def PBDStep(vertex: wp.array(dtype=wp.vec3),
@@ -2144,6 +2232,19 @@ class SimIntegratorDO():
                       inputs=[simModel.predictedVertex,
                               simModel.groundLevel],
                       device=simModel.device)
+
+            # Deformable-rigid mesh collision (e.g. tumor vs bone)
+            if hasattr(simModel, 'rigidCollisionVertex') and simModel.numRigidCollisionTris > 0:
+                wp.launch(kernel=collideDeformableRigidMesh,
+                          dim=simModel.numVertices,
+                          inputs=[simModel.predictedVertex,
+                                  simModel.inverseMass,
+                                  simModel.numVertices,
+                                  simModel.rigidCollisionVertex,
+                                  simModel.rigidCollisionTriangle,
+                                  simModel.numRigidCollisionTris,
+                                  0.15],  # collision margin (cm)
+                          device=simModel.device)
             
             damping = getattr(simModel, 'velocityDamping', 1.0)
             if damping < 1.0:

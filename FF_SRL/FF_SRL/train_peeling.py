@@ -47,7 +47,7 @@ def main():
     # Environment
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--sim_substeps", type=int, default=16)
-    parser.add_argument("--action_strength", type=float, default=0.08,
+    parser.add_argument("--action_strength", type=float, default=0.04,
                         help="Pull displacement per step (cm)")
     parser.add_argument("--stretch_abs_min", type=float, default=0.5,
                         help="Adhesion break threshold (cm)")

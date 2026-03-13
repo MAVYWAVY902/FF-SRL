@@ -32,7 +32,7 @@ def main():
     parser.add_argument("--output", type=str, default="peeling_demo.mp4")
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--fps", type=int, default=15)
-    parser.add_argument("--action_strength", type=float, default=0.08)
+    parser.add_argument("--action_strength", type=float, default=0.04)
     parser.add_argument("--no_video", action="store_true",
                         help="Show live window instead of saving video")
     args = parser.parse_args()
@@ -74,7 +74,7 @@ def main():
     simModel.velocityDamping = 0.9
 
     # Create adhesion bonds
-    simModel.createRigidAdhesionFromMeshes(bondDistance=0.5)
+    simModel.createRigidAdhesionFromMeshes(bondDistance=0.25)
     total_bonds = simModel.numRigidAdhesionBonds
     print(f"Total adhesion bonds: {total_bonds}")
 
@@ -218,10 +218,13 @@ def main():
     simModel.forceLaparoscopeClampRegion(
         grab_vertex_idx, 0.5, envs, on=1.0, animate=True)
 
-    # Settle (let tissue reach equilibrium with damping before rendering)
-    for _ in range(30):
+    # Settle with aggressive damping to suppress oscillation
+    original_damping = simModel.velocityDamping
+    simModel.velocityDamping = 0.5  # strong damping for settle
+    for _ in range(50):
         simModel.resetCollisionInfo()
         simIntegrator.stepModel(simModel)
+    simModel.velocityDamping = original_damping
 
     # --- Load trained model ---
     print(f"Loading model: {args.model}")

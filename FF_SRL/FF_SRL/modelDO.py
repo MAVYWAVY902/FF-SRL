@@ -1391,6 +1391,11 @@ class SimModelDO():
                 self.numRigidVisPoints = len(rigidVisPoint)
                 self.numRigidVisFaces = int(len(rigidVisFace)/3)
 
+                # Store rigid mesh on GPU for deformable-rigid collision
+                self.rigidCollisionVertex = wp.array(rigidVisPoint, dtype=wp.vec3, device=self.device)
+                self.rigidCollisionTriangle = wp.array(rigidVisFace, dtype=wp.int32, device=self.device)
+                self.numRigidCollisionTris = int(len(rigidVisFace)/3)
+
                 # Mapping
                 self.pointToVertex = wp.array(pointToVertex, dtype=wp.int32, device=self.device)
                 self.triToEnv = wp.array(triToEnv, dtype=wp.int32, device=self.device)

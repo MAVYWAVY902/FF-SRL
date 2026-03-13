@@ -34,9 +34,9 @@ class TumorPeelingEnv(gym.Env):
         sim_substeps=16,
         sim_fps=30,
         # Action
-        action_strength=0.08,  # cm per step
+        action_strength=0.04,  # cm per step
         # Adhesion
-        bond_distance=0.5,     # cm (match C++ d_bond saturation)
+        bond_distance=0.25,    # cm - bond contacting surface
         adhesion_d_contact=0.03,
         adhesion_d_rest=0.32,
         adhesion_d_neutral_start=0.5,
@@ -202,16 +202,20 @@ class TumorPeelingEnv(gym.Env):
         # Re-grab
         self._position_and_grab()
 
-        # Settle (let tissue reach equilibrium with damping)
-        for _ in range(20):
+        # Settle with aggressive damping to suppress oscillation
+        original_damping = self.simModel.velocityDamping
+        self.simModel.velocityDamping = 0.5  # strong damping for settle
+        for _ in range(50):
             self.simModel.resetCollisionInfo()
             self.simIntegrator.stepModel(self.simModel)
+        self.simModel.velocityDamping = original_damping
 
         self._step_count = 0
         self._prev_broken = self._get_broken_count()
         self._prev_max_deform = 0.0
 
         obs = self._get_obs()
+        self._initial_tip_y = obs[1]  # remember initial tip Y for penetration penalty
         info = {"broken": self._prev_broken, "total_bonds": self.total_bonds}
 
         return obs, info
@@ -237,12 +241,17 @@ class TumorPeelingEnv(gym.Env):
         max_deform = obs[4]  # max_deformation from obs
         deform_increase = max(0.0, max_deform - self._prev_max_deform)
 
-        # Reward
+        # Penalize downward movement (pushing into bone)
+        verts = self.simModel.vertex.numpy()
+        tip_y = obs[1]  # current tip Y
+        tip_y_drop = max(0.0, self._initial_tip_y - tip_y)  # how far below start
+
+        # Reward: break bonds (+) but penalize deformation and downward push
         reward = (self.reward_break_weight * new_breaks
-                  - self.reward_deform_penalty * deform_increase)
+                  - self.reward_deform_penalty * deform_increase
+                  - 2.0 * tip_y_drop)  # penalize pushing into bone
 
         # Check NaN
-        verts = self.simModel.vertex.numpy()
         has_nan = np.any(np.isnan(verts))
 
         # Done conditions
