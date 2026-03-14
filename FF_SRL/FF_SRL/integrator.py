@@ -553,6 +553,41 @@ def dragConstraintsDO(predictedVertex: wp.array(dtype=wp.vec3),
     wp.atomic_add(constraintsNumber, tid, 1)
 
 @wp.kernel
+def pushConstraintsDO(predictedVertex: wp.array(dtype=wp.vec3),
+                      dP: wp.array(dtype=wp.vec3),
+                      constraintsNumber: wp.array(dtype=wp.int32),
+                      inverseMass: wp.array(dtype=wp.float32),
+                      tipPos: wp.array(dtype=wp.vec3),
+                      pushRadius: float,
+                      pushStrength: float):
+    """Push free vertices away from dissector tip position.
+
+    Vertices within pushRadius are displaced radially outward from the tip.
+    Force has linear falloff: strongest at tip, zero at pushRadius boundary.
+    Only affects free vertices (inverseMass > 0).
+    """
+    tid = wp.tid()
+
+    if inverseMass[tid] == 0.0:
+        return
+
+    pos = predictedVertex[tid]
+    tip = tipPos[0]
+    diff = pos - tip
+    dist = wp.length(diff)
+
+    if dist < FLOAT_EPSILON or dist > pushRadius:
+        return
+
+    # Linear falloff: full strength at tip, zero at pushRadius
+    falloff = 1.0 - dist / pushRadius
+    direction = wp.normalize(diff)
+    displacement = direction * pushStrength * falloff
+
+    wp.atomic_add(dP, tid, displacement)
+    wp.atomic_add(constraintsNumber, tid, 1)
+
+@wp.kernel
 def volumeConstraints(predictedVertex: wp.array(dtype=wp.vec3),
                       dP: wp.array(dtype=wp.vec3),
                       constraintsNumber: wp.array(dtype=wp.int32),
@@ -2187,6 +2222,19 @@ class SimIntegratorDO():
                                   simModel.laparoscopeTip,
                                   simModel.globalKsDrag],
                           device=simModel.device)
+
+                # Push constraint: dissector pushes nearby vertices away
+                if hasattr(simModel, 'pushTipPos') and simModel.pushTipPos is not None:
+                    wp.launch(kernel=pushConstraintsDO,
+                              dim=simModel.numVertices,
+                              inputs=[simModel.predictedVertex,
+                                      simModel.dP,
+                                      simModel.constraintsNumber,
+                                      simModel.inverseMass,
+                                      simModel.pushTipPos,
+                                      simModel.pushRadius,
+                                      simModel.pushStrength],
+                              device=simModel.device)
 
                 # Apply all constraints (elastic + drag) averaged together
                 wp.launch(kernel=applyConstraints,
