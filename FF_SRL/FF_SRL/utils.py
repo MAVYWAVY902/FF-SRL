@@ -86,6 +86,71 @@ def transformVec(vec, xForm):
 
     return transformed
 
+def build_adjacency(faces, num_verts):
+    """Build vertex adjacency list from triangle faces (flat int array)."""
+    from collections import defaultdict
+    adj = defaultdict(set)
+    num_tris = len(faces) // 3
+    for i in range(num_tris):
+        i0, i1, i2 = faces[i*3], faces[i*3+1], faces[i*3+2]
+        adj[i0].add(i1); adj[i0].add(i2)
+        adj[i1].add(i0); adj[i1].add(i2)
+        adj[i2].add(i0); adj[i2].add(i1)
+    return adj
+
+
+def laplacian_smooth_vis_points(allVisPoint_wp, allVisFace_wp, num_mesh_vis, num_mesh_faces,
+                                 iterations=2, lam=0.5, device="cuda:0"):
+    """Apply Laplacian smoothing to deformable mesh vis points only.
+
+    Smooths only the first `num_mesh_vis` points (tumor), leaving rigid/laparoscope untouched.
+    Uses Taubin smoothing (smooth + inflate) to avoid shrinkage.
+
+    Args:
+        allVisPoint_wp: warp array of all vis points
+        allVisFace_wp: warp array of all vis face indices (flat)
+        num_mesh_vis: number of deformable mesh vis points
+        num_mesh_faces: number of deformable mesh vis faces
+        iterations: number of smooth-inflate cycles
+        lam: smoothing factor (0-1)
+        device: warp device
+    Returns:
+        Updated warp array
+    """
+    pts = allVisPoint_wp.numpy()
+    faces = allVisFace_wp.numpy()
+
+    # Build adjacency from deformable mesh faces only
+    adj = build_adjacency(faces[:num_mesh_faces * 3], num_mesh_vis)
+
+    mesh_pts = pts[:num_mesh_vis].copy()
+    mu = -lam / 0.9  # Taubin inflate factor (slightly less than -lam to avoid shrinkage)
+
+    for _ in range(iterations):
+        # Smooth step
+        new_pts = mesh_pts.copy()
+        for v in range(num_mesh_vis):
+            neighbors = adj.get(v)
+            if not neighbors:
+                continue
+            neighbor_mean = mesh_pts[list(neighbors)].mean(axis=0)
+            new_pts[v] = mesh_pts[v] + lam * (neighbor_mean - mesh_pts[v])
+        mesh_pts = new_pts
+
+        # Inflate step (Taubin)
+        new_pts = mesh_pts.copy()
+        for v in range(num_mesh_vis):
+            neighbors = adj.get(v)
+            if not neighbors:
+                continue
+            neighbor_mean = mesh_pts[list(neighbors)].mean(axis=0)
+            new_pts[v] = mesh_pts[v] + mu * (neighbor_mean - mesh_pts[v])
+        mesh_pts = new_pts
+
+    pts[:num_mesh_vis] = mesh_pts
+    return wp.array(pts, dtype=wp.vec3, device=device)
+
+
 def getBoxSpanVectors(xForm):
     p1 = xForm.Transform(Gf.Vec3f(-0.5, -0.5, -0.5))
     p2 = xForm.Transform(Gf.Vec3f(0.5, -0.5, -0.5))

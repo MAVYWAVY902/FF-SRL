@@ -1,16 +1,17 @@
 """
 Gymnasium environment for tumor dissection with adhesion bonds.
 
-Task: Control dissector tip to push along tumor-bone interface,
-      breaking adhesion bonds by mechanical dissection.
+Task: Control dissector tip sliding along the tumor-bone interface
+      to break adhesion bonds by pushing tumor upward from bone.
 
-Unlike peeling (grasp & pull), the dissector pushes tissue away from bone,
-locally separating adhesion bonds — matching real surgical debulking.
+The dissector moves in the XZ plane (along the interface), with its
+Y height locked slightly above the bone surface. It pushes nearby
+tumor vertices upward, stretching and breaking adhesion bonds locally.
 
-Action:  3D dissector movement (dx, dy, dz), continuous [-1, 1]
-Obs:     [tip_x, tip_y, tip_z, bonds_alive_ratio, max_deformation,
-          local_broken_ratio, tip_y_above_bone]
-Reward:  +new_broken_bonds - λ * deformation - penalty_bone_contact
+Action:  2D dissector movement (dx, dz) along interface, continuous [-1, 1]
+Obs:     [tip_x, tip_z, bonds_alive_ratio, max_deformation,
+          local_broken_ratio, dx_to_nearest_active, dz_to_nearest_active]
+Reward:  +new_broken_bonds - λ * deformation + progress_toward_bonds
 Done:    bonds_broken >= target_ratio OR max_steps reached
 """
 
@@ -38,7 +39,7 @@ class TumorDissectionEnv(gym.Env):
         sim_substeps=16,
         sim_fps=30,
         # Action
-        action_strength=0.04,  # cm per step
+        action_strength=0.04,  # cm per step in XZ plane
         # Adhesion
         bond_distance=0.25,    # cm
         adhesion_d_contact=0.03,
@@ -50,13 +51,14 @@ class TumorDissectionEnv(gym.Env):
         # Push
         push_radius=0.6,      # cm - radius of push influence
         push_strength=0.08,   # cm - max displacement per constraint solve
+        tip_height_above_bone=0.15,  # cm - dissector height above bone surface
         # Task
         target_break_ratio=0.6,
-        max_steps=200,
+        max_steps=300,
         # Reward
         reward_break_weight=1.0,
         reward_deform_penalty=0.01,
-        reward_bone_contact_penalty=1.0,
+        reward_proximity_weight=0.1,  # reward for moving toward active bonds
     ):
         super().__init__()
 
@@ -66,9 +68,10 @@ class TumorDissectionEnv(gym.Env):
         self.action_strength = action_strength
         self.push_radius = push_radius
         self.push_strength = push_strength
+        self.tip_height_above_bone = tip_height_above_bone
         self.reward_break_weight = reward_break_weight
         self.reward_deform_penalty = reward_deform_penalty
-        self.reward_bone_contact_penalty = reward_bone_contact_penalty
+        self.reward_proximity_weight = reward_proximity_weight
 
         self._adhesion_params = dict(
             globalAdhesionDContact=adhesion_d_contact,
@@ -87,12 +90,12 @@ class TumorDissectionEnv(gym.Env):
                 os.path.dirname(__file__), 'scenes', 'tumorBone.usd')
         self._usd_path = usd_path
 
-        # Action space: 3D dissector tip movement
+        # Action space: 2D movement in XZ plane (along interface)
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
+            low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # Obs: [tip_x, tip_y, tip_z, bonds_alive_ratio, max_deformation,
-        #       local_broken_ratio, tip_y_above_bone]
+        # Obs: [tip_x, tip_z, bonds_alive_ratio, max_deformation,
+        #       local_broken_ratio, dx_to_nearest_active, dz_to_nearest_active]
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
 
@@ -135,6 +138,10 @@ class TumorDissectionEnv(gym.Env):
         else:
             self._bond_rigid_points = np.zeros((0, 3), dtype=np.float32)
 
+        # Bond XZ positions (for 2D distance calculations)
+        n_per_env = self.simModel.numRigidAdhesionBondsPerEnv
+        self._bond_xz = self._bond_rigid_points[:n_per_env, [0, 2]].copy()
+
         # Integrator
         self.simIntegrator = dk.SimIntegratorDO(self.device)
 
@@ -143,6 +150,9 @@ class TumorDissectionEnv(gym.Env):
 
         # Compute bone surface Y (top of bone = bottom of interface)
         self._bone_top_y = self._compute_bone_top_y()
+
+        # Dissector tip Y is locked at this height
+        self._tip_y = self._bone_top_y + self.tip_height_above_bone
 
         # Find starting position: edge of tumor-bone interface
         self._start_pos = self._find_interface_edge()
@@ -164,22 +174,16 @@ class TumorDissectionEnv(gym.Env):
         return float(rigidVerts[:, 1].max())
 
     def _find_interface_edge(self):
-        """Find starting position at the edge of tumor-bone adhesion interface.
-
-        Strategy: find the bond with the largest X (or Z) coordinate —
-        this is at the periphery of the adhesion zone. Start the dissector
-        slightly outside and above it.
-        """
+        """Find starting position at the edge of tumor-bone adhesion interface."""
         if len(self._bond_rigid_points) == 0:
-            # Fallback: top of tumor
             verts = self.simModel.vertex.numpy()
             inv_mass = self.simModel.inverseMass.numpy()
             free_idx = np.where(inv_mass > 0.0)[0]
             top_idx = free_idx[np.argmax(verts[free_idx, 1])]
             return verts[top_idx].copy()
 
-        # Bond rigid points are on the bone surface
-        bond_pts = self._bond_rigid_points[:self.simModel.numRigidAdhesionBondsPerEnv]
+        n_per_env = self.simModel.numRigidAdhesionBondsPerEnv
+        bond_pts = self._bond_rigid_points[:n_per_env]
         centroid = bond_pts.mean(axis=0)
 
         # Find the bond furthest from centroid in XZ plane (edge of interface)
@@ -188,7 +192,7 @@ class TumorDissectionEnv(gym.Env):
         edge_idx = np.argmax(xz_dist)
         edge_pt = bond_pts[edge_idx].copy()
 
-        # Start slightly outside the interface edge and above bone
+        # Start slightly outside the interface edge
         direction_xz = edge_pt - centroid
         direction_xz[1] = 0.0
         norm = np.linalg.norm(direction_xz)
@@ -197,24 +201,22 @@ class TumorDissectionEnv(gym.Env):
         else:
             direction_xz = np.array([1.0, 0.0, 0.0])
 
-        # Position: edge + small offset outward, and above bone surface
-        start = edge_pt + direction_xz * 0.3  # 0.3 cm outside edge
-        start[1] = self._bone_top_y + 0.2     # slightly above bone
+        start = edge_pt + direction_xz * 0.3
+        start[1] = self._tip_y  # locked height
 
         print(f"  Interface edge: {edge_pt}")
         print(f"  Dissector start: {start}")
-        print(f"  Bone top Y: {self._bone_top_y:.2f}")
+        print(f"  Bone top Y: {self._bone_top_y:.2f}, Tip Y: {self._tip_y:.2f}")
 
         return start
 
     def _setup_push_arrays(self):
         """Create warp arrays for the push constraint on simModel."""
-        # Single vec3 for the tip position
         self.simModel.pushTipPos = wp.zeros(1, dtype=wp.vec3, device=self.device)
         self.simModel.pushRadius = self.push_radius
         self.simModel.pushStrength = self.push_strength
 
-        # Track tip position in numpy for obs
+        # Track tip position in numpy
         self._tip_pos = self._start_pos.copy()
 
     def _position_dissector(self, pos):
@@ -229,31 +231,47 @@ class TumorDissectionEnv(gym.Env):
             dtype=torch.float32, device=self.device)
         self.simModel.applyCartesianActions(wp.from_torch(action))
 
-        # Update push tip position
         self._tip_pos = pos.copy()
         self._update_push_tip()
 
     def _update_push_tip(self):
         """Write current tip position to the GPU push array."""
-        tip_np = np.array([self._tip_pos], dtype=np.float32).reshape(1, 3)
         self.simModel.pushTipPos = wp.array(
             [wp.vec3(self._tip_pos[0], self._tip_pos[1], self._tip_pos[2])],
             dtype=wp.vec3, device=self.device)
 
-    def _get_local_broken_ratio(self, radius=1.0):
-        """Fraction of bonds broken near the current tip position.
+    def _get_nearest_active_bond_dir(self):
+        """Get XZ direction to nearest active (unbroken) bond from tip."""
+        n_per_env = self.simModel.numRigidAdhesionBondsPerEnv
+        active = self.simModel.rigidAdhesionActive.numpy()[:n_per_env]
 
-        Looks at bonds whose rigid anchor is within `radius` cm of tip.
-        """
+        active_mask = active > 0.5
+        if not np.any(active_mask):
+            return np.array([0.0, 0.0], dtype=np.float32)
+
+        active_xz = self._bond_xz[active_mask]
+        tip_xz = np.array([self._tip_pos[0], self._tip_pos[2]])
+
+        dists = np.linalg.norm(active_xz - tip_xz, axis=1)
+        nearest_idx = np.argmin(dists)
+        nearest_xz = active_xz[nearest_idx]
+
+        direction = nearest_xz - tip_xz
+        dist = np.linalg.norm(direction)
+        if dist > 1e-6:
+            direction /= dist  # normalize to unit direction
+        return direction.astype(np.float32)
+
+    def _get_local_broken_ratio(self, radius=1.0):
+        """Fraction of bonds broken near the current tip position (XZ distance)."""
         if self.total_bonds == 0:
             return 0.0
 
         n_per_env = self.simModel.numRigidAdhesionBondsPerEnv
-        bond_pts = self._bond_rigid_points[:n_per_env]
         active = self.simModel.rigidAdhesionActive.numpy()[:n_per_env]
+        tip_xz = np.array([self._tip_pos[0], self._tip_pos[2]])
 
-        # Distance from tip to each bond anchor
-        dists = np.linalg.norm(bond_pts - self._tip_pos, axis=1)
+        dists = np.linalg.norm(self._bond_xz - tip_xz, axis=1)
         nearby = dists < radius
 
         n_nearby = int(np.sum(nearby))
@@ -265,7 +283,6 @@ class TumorDissectionEnv(gym.Env):
 
     def _get_obs(self):
         """Get observation vector."""
-        # Tip position
         tip = self._tip_pos.copy()
 
         # Global bonds alive ratio
@@ -280,15 +297,16 @@ class TumorDissectionEnv(gym.Env):
         # Local broken ratio near tip
         local_broken = self._get_local_broken_ratio(radius=1.0)
 
-        # Tip height above bone surface (negative = below bone = bad)
-        tip_above_bone = tip[1] - self._bone_top_y
+        # Direction to nearest active bond (guides agent toward unbroken bonds)
+        nearest_dir = self._get_nearest_active_bond_dir()
 
         obs = np.array([
-            tip[0], tip[1], tip[2],
+            tip[0], tip[2],        # tip XZ position
             alive_ratio,
             max_deform,
             local_broken,
-            tip_above_bone,
+            nearest_dir[0],        # dx to nearest active bond (normalized)
+            nearest_dir[1],        # dz to nearest active bond (normalized)
         ], dtype=np.float32)
 
         return obs
@@ -324,26 +342,43 @@ class TumorDissectionEnv(gym.Env):
         self._step_count = 0
         self._prev_broken = self._get_broken_count()
         self._prev_max_deform = 0.0
+        self._prev_dist_to_nearest = self._get_dist_to_nearest_active()
 
         obs = self._get_obs()
         info = {"broken": self._prev_broken, "total_bonds": self.total_bonds}
 
         return obs, info
 
+    def _get_dist_to_nearest_active(self):
+        """XZ distance to nearest active bond."""
+        n_per_env = self.simModel.numRigidAdhesionBondsPerEnv
+        active = self.simModel.rigidAdhesionActive.numpy()[:n_per_env]
+        active_mask = active > 0.5
+        if not np.any(active_mask):
+            return 0.0
+        active_xz = self._bond_xz[active_mask]
+        tip_xz = np.array([self._tip_pos[0], self._tip_pos[2]])
+        return float(np.min(np.linalg.norm(active_xz - tip_xz, axis=1)))
+
     def step(self, action):
         self._step_count += 1
 
-        # Scale and apply action to laparoscope
+        # 2D action -> 3D: move in XZ plane, Y stays locked
         action = np.clip(action, -1.0, 1.0)
-        scaled = action * self.action_strength
-        action_tensor = torch.tensor(scaled, dtype=torch.float32,
-                                     device=self.device)
-        self.simModel.applyCartesianActions(wp.from_torch(action_tensor))
+        dx = action[0] * self.action_strength
+        dz = action[1] * self.action_strength
 
-        # Update tip position from laparoscope
+        # Apply 3D action (dx, 0, dz) — Y movement is zero
+        action_3d = torch.tensor(
+            [dx, 0.0, dz], dtype=torch.float32, device=self.device)
+        self.simModel.applyCartesianActions(wp.from_torch(action_3d))
+
+        # Read actual laparoscope position but override Y to stay locked
         lap_pos = self.simModel.getLaparoscopePositionsTensor()
-        tip_torch = lap_pos[0].cpu().numpy()
-        self._tip_pos = tip_torch.copy()
+        tip_actual = lap_pos[0].cpu().numpy()
+        self._tip_pos[0] = tip_actual[0]
+        self._tip_pos[1] = self._tip_y   # lock Y at interface height
+        self._tip_pos[2] = tip_actual[2]
         self._update_push_tip()
 
         # Step physics (push kernel runs inside stepModel)
@@ -354,21 +389,19 @@ class TumorDissectionEnv(gym.Env):
         obs = self._get_obs()
         broken_now = self._get_broken_count()
         new_breaks = broken_now - self._prev_broken
-        max_deform = obs[4]
+        max_deform = obs[3]  # index 3 in new obs layout
         deform_increase = max(0.0, max_deform - self._prev_max_deform)
 
-        # Tip height above bone
-        tip_above_bone = obs[6]  # can be negative if below bone
-
-        # Reward
+        # Reward: break bonds
         reward = self.reward_break_weight * new_breaks
 
         # Penalize deformation
         reward -= self.reward_deform_penalty * deform_increase
 
-        # Penalize going below bone surface
-        if tip_above_bone < 0:
-            reward -= self.reward_bone_contact_penalty * abs(tip_above_bone)
+        # Proximity reward: getting closer to active bonds
+        dist_to_nearest = self._get_dist_to_nearest_active()
+        dist_improvement = self._prev_dist_to_nearest - dist_to_nearest
+        reward += self.reward_proximity_weight * max(0.0, dist_improvement)
 
         # Check NaN
         verts = self.simModel.vertex.numpy()
@@ -380,11 +413,12 @@ class TumorDissectionEnv(gym.Env):
         truncated = (self._step_count >= self.max_steps) or has_nan
 
         if terminated:
-            reward += 50.0  # success bonus
+            reward += 50.0
 
         # Update state
         self._prev_broken = broken_now
         self._prev_max_deform = max_deform
+        self._prev_dist_to_nearest = dist_to_nearest
 
         info = {
             "broken": broken_now,
@@ -392,7 +426,7 @@ class TumorDissectionEnv(gym.Env):
             "max_deformation_mm": max_deform * 10,
             "new_breaks": new_breaks,
             "step": self._step_count,
-            "tip_above_bone": tip_above_bone,
+            "dist_to_nearest": dist_to_nearest,
         }
 
         return obs, float(reward), bool(terminated), bool(truncated), info

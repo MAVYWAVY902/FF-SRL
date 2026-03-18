@@ -152,7 +152,7 @@ class TumorPeelingEnv(gym.Env):
     def _position_and_grab(self):
         """Move laparoscope tip to grab point and clamp region."""
         target = torch.tensor(
-            [self._grab_pos[0], self._grab_pos[1] + 0.1, self._grab_pos[2]],
+            [self._grab_pos[0], self._grab_pos[1] - 0.5, self._grab_pos[2]],
             dtype=torch.float32, device=self.device)
         lap_pos = self.simModel.getLaparoscopePositionsTensor()
         delta = target - lap_pos[0]

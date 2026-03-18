@@ -33,9 +33,10 @@ def make_env(args):
         max_steps=args.max_steps,
         push_radius=args.push_radius,
         push_strength=args.push_strength,
+        tip_height_above_bone=args.tip_height,
         reward_break_weight=args.reward_break_weight,
         reward_deform_penalty=args.reward_deform_penalty,
-        reward_bone_contact_penalty=args.reward_bone_contact_penalty,
+        reward_proximity_weight=args.reward_proximity_weight,
     )
     env = Monitor(env)
     return env
@@ -52,14 +53,17 @@ def main():
     parser.add_argument("--stretch_abs_min", type=float, default=0.5)
     parser.add_argument("--break_ratio", type=float, default=1.27)
     parser.add_argument("--target_break_ratio", type=float, default=0.6)
-    parser.add_argument("--max_steps", type=int, default=200)
+    parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--push_radius", type=float, default=0.6,
                         help="Push influence radius (cm)")
     parser.add_argument("--push_strength", type=float, default=0.08,
                         help="Max push displacement per constraint solve (cm)")
+    parser.add_argument("--tip_height", type=float, default=0.15,
+                        help="Dissector height above bone surface (cm)")
     parser.add_argument("--reward_break_weight", type=float, default=1.0)
     parser.add_argument("--reward_deform_penalty", type=float, default=0.01)
-    parser.add_argument("--reward_bone_contact_penalty", type=float, default=1.0)
+    parser.add_argument("--reward_proximity_weight", type=float, default=0.1,
+                        help="Reward for moving toward active bonds")
 
     # SAC
     parser.add_argument("--total_timesteps", type=int, default=100000)

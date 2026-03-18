@@ -1,7 +1,7 @@
 from FF_SRL.model import SimObject, SimMesh, SimLockBox, SimConnector, SimElasticRod, SimContext, SimInteractions, SimModel, SimEnvironment
 from FF_SRL.modelDO import SimMeshDO, SimConnectorDO, SimAdhesionDO, SimLockBoxDO, SimModelDO, SimEnvironmentDO, SimRigidDO
 from FF_SRL.integrator import SimIntegrator, SimIntegratorDO
-from FF_SRL.utils import launchTransformVecArrayWarp, transformVecArray, getBoxSpanVectors, checkIfWithinBounds, launchRemapAToB, launchRemapAToBLimited, generateTriMeshCapsule, generateTriMeshSphere, multiplyListVector, subtractListVectors, addListVectors, calculateListVectorNormalized, crossListVector, getTransformationMatrix, launchTransformVecArrayWarp2
+from FF_SRL.utils import launchTransformVecArrayWarp, transformVecArray, getBoxSpanVectors, checkIfWithinBounds, launchRemapAToB, launchRemapAToBLimited, generateTriMeshCapsule, generateTriMeshSphere, multiplyListVector, subtractListVectors, addListVectors, calculateListVectorNormalized, crossListVector, getTransformationMatrix, launchTransformVecArrayWarp2, laplacian_smooth_vis_points
 from FF_SRL.render import WarpRaycastRendererDO
 from FF_SRL.laparoscope import SimLaparoscopeDO
 from FF_SRL.bvh import SimBVH

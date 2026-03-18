@@ -205,7 +205,7 @@ def main():
 
     # Position laparoscope and grab
     target = torch.tensor(
-        [grab_pos[0], grab_pos[1] + 0.1, grab_pos[2]],
+        [grab_pos[0], grab_pos[1] - 0.5, grab_pos[2]],
         dtype=torch.float32, device=device)
     lap_pos = simModel.getLaparoscopePositionsTensor()
     delta = target - lap_pos[0]
@@ -218,10 +218,10 @@ def main():
     simModel.forceLaparoscopeClampRegion(
         grab_vertex_idx, 0.5, envs, on=1.0, animate=True)
 
-    # Settle with aggressive damping to suppress oscillation
+    # Settle with very aggressive damping to suppress oscillation and reduce bumps
     original_damping = simModel.velocityDamping
-    simModel.velocityDamping = 0.5  # strong damping for settle
-    for _ in range(50):
+    simModel.velocityDamping = 0.3  # very strong damping
+    for _ in range(200):
         simModel.resetCollisionInfo()
         simIntegrator.stepModel(simModel)
     simModel.velocityDamping = original_damping
@@ -310,7 +310,6 @@ def main():
 
         if break_ratio >= 0.6:
             print(f"\n*** SUCCESS! Reached {break_ratio*100:.1f}% breakage at step {step} ***")
-            # Render a few more frames to show the final state
             for _ in range(10):
                 simBVH.refitBVH()
                 img_tensor = renderer.render(simBVH, simModel)

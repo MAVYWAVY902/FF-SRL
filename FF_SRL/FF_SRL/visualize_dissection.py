@@ -3,7 +3,6 @@ Visualize trained SAC dissection policy with GPU ray-traced rendering.
 
 Usage:
     python -m FF_SRL.visualize_dissection --model ./output/dissection_sac_XXXXX/final_model.zip
-    python -m FF_SRL.visualize_dissection --model ./output/dissection_sac_XXXXX/best/best_model.zip
 """
 
 import argparse
@@ -24,13 +23,14 @@ def main():
     parser.add_argument("--model", type=str, required=True,
                         help="Path to trained SAC model (.zip)")
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--max_steps", type=int, default=250)
+    parser.add_argument("--max_steps", type=int, default=350)
     parser.add_argument("--output", type=str, default="dissection_demo.mp4")
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--fps", type=int, default=15)
-    parser.add_argument("--action_strength", type=float, default=0.04)
-    parser.add_argument("--push_radius", type=float, default=0.6)
-    parser.add_argument("--push_strength", type=float, default=0.08)
+    parser.add_argument("--action_strength", type=float, default=0.1)
+    parser.add_argument("--push_radius", type=float, default=0.8)
+    parser.add_argument("--push_strength", type=float, default=0.3)
+    parser.add_argument("--tip_height", type=float, default=0.15)
     args = parser.parse_args()
 
     device = args.device
@@ -46,8 +46,8 @@ def main():
         globalLaparoscopeDragLookupRadius=0.5,
         environmentGroundLevel=-100.0,
         globalAdhesionDContact=0.03, globalAdhesionDRest=0.32,
-        globalAdhesionDNeutralStart=0.5, globalAdhesionBreakRatio=1.27,
-        globalAdhesionStretchAbsMin=0.5, globalAdhesionAlpha=1e-6,
+        globalAdhesionDNeutralStart=0.5, globalAdhesionBreakRatio=1.1,
+        globalAdhesionStretchAbsMin=0.3, globalAdhesionAlpha=1e-6,
     )
 
     simModel.globalMu = 1e7
@@ -63,6 +63,7 @@ def main():
     # Store bond rigid points for local observation
     bond_rigid_points = simModel.rigidAdhesionRigidPoint.numpy().copy()
     n_per_env = simModel.numRigidAdhesionBondsPerEnv
+    bond_xz = bond_rigid_points[:n_per_env, [0, 2]].copy()
 
     simIntegrator = dk.SimIntegratorDO(device)
     initial_verts = simModel.initialVertex.numpy().copy()
@@ -72,8 +73,9 @@ def main():
     for simRigid in simModel.simEnvironment.simRigids:
         rigidVerts.append(np.array(simRigid.vertex))
     bone_top_y = float(np.vstack(rigidVerts)[:, 1].max())
+    tip_y = bone_top_y + args.tip_height
 
-    # --- Find interface edge (same as env) ---
+    # --- Find interface edge ---
     bond_pts = bond_rigid_points[:n_per_env]
     centroid = bond_pts.mean(axis=0)
     xz_dist = np.sqrt((bond_pts[:, 0] - centroid[0])**2 +
@@ -86,10 +88,11 @@ def main():
     if norm > 1e-6:
         direction_xz /= norm
     start_pos = edge_pt + direction_xz * 0.3
-    start_pos[1] = bone_top_y + 0.2
-    print(f"Dissector start: {start_pos}")
+    start_pos[1] = tip_y
+    tip_pos = start_pos.copy()
+    print(f"Dissector start: {start_pos}, tip_y locked at: {tip_y:.2f}")
 
-    # --- Position dissector at interface edge ---
+    # --- Position dissector ---
     target = torch.tensor(start_pos, dtype=torch.float32, device=device)
     lap_pos = simModel.getLaparoscopePositionsTensor()
     delta = target - lap_pos[0]
@@ -99,18 +102,17 @@ def main():
     simModel.applyCartesianActions(wp.from_torch(action))
 
     # Setup push arrays
-    tip_pos = start_pos.copy()
     simModel.pushTipPos = wp.array(
         [wp.vec3(tip_pos[0], tip_pos[1], tip_pos[2])],
         dtype=wp.vec3, device=device)
     simModel.pushRadius = args.push_radius
     simModel.pushStrength = args.push_strength
 
-    # Settle (push disabled during settle)
+    # Settle (push disabled)
     simModel.pushTipPos = None
     original_damping = simModel.velocityDamping
-    simModel.velocityDamping = 0.5
-    for _ in range(50):
+    simModel.velocityDamping = 0.3  # very strong damping
+    for _ in range(200):
         simModel.resetCollisionInfo()
         simIntegrator.stepModel(simModel)
     simModel.velocityDamping = original_damping
@@ -171,7 +173,6 @@ def main():
     )
     renderer.render_mode = dk.render.RenderMode.vertex_color
 
-    # Set colors
     colors = simModel.allVisPointColor.numpy()
     n_mesh = simModel.numVisPoints
     n_rigid = simModel.numEnvRigidsVisPoints
@@ -187,27 +188,36 @@ def main():
     model = SAC.load(args.model, device="cpu")
     print("Model loaded!")
 
-    # --- Observation helper ---
+    # --- Observation helper (matches env obs layout) ---
     def get_obs():
-        lp = simModel.getLaparoscopePositionsTensor()
-        tip = lp[0].cpu().numpy()
         active = simModel.rigidAdhesionActive.numpy()
         alive_ratio = float(np.sum(active > 0.5)) / max(total_bonds, 1)
         v = simModel.vertex.numpy()
         max_deform = float(np.max(np.linalg.norm(v - initial_verts, axis=1)))
 
         # Local broken ratio
-        bp = bond_rigid_points[:n_per_env]
         act = active[:n_per_env]
-        dists = np.linalg.norm(bp - tip, axis=1)
+        tip_xz_arr = np.array([tip_pos[0], tip_pos[2]])
+        dists = np.linalg.norm(bond_xz - tip_xz_arr, axis=1)
         nearby = dists < 1.0
         n_nearby = int(np.sum(nearby))
         local_broken = int(np.sum((nearby) & (act < 0.5))) / max(n_nearby, 1)
 
-        tip_above_bone = tip[1] - bone_top_y
+        # Direction to nearest active bond
+        active_mask = act > 0.5
+        if np.any(active_mask):
+            active_xz = bond_xz[active_mask]
+            d = np.linalg.norm(active_xz - tip_xz_arr, axis=1)
+            nearest = active_xz[np.argmin(d)]
+            direction = nearest - tip_xz_arr
+            dn = np.linalg.norm(direction)
+            if dn > 1e-6:
+                direction /= dn
+        else:
+            direction = np.array([0.0, 0.0])
 
-        return np.array([tip[0], tip[1], tip[2], alive_ratio, max_deform,
-                         local_broken, tip_above_bone], dtype=np.float32)
+        return np.array([tip_pos[0], tip_pos[2], alive_ratio, max_deform,
+                         local_broken, direction[0], direction[1]], dtype=np.float32)
 
     # --- Render loop ---
     frames = []
@@ -223,27 +233,29 @@ def main():
         try:
             import imageio
             imageio.imwrite("debug_dissection_frame0.png", frame)
-            print("Saved debug_dissection_frame0.png")
         except Exception:
             pass
 
     print(f"\nRunning dissection policy for {args.max_steps} steps...")
-    print(f"{'Step':>5} {'Broken':>8} {'%':>7} {'NewBrk':>7} {'TipAbvBone':>11} {'Action':>30}")
-    print("-" * 75)
+    print(f"{'Step':>5} {'Broken':>8} {'%':>7} {'NewBrk':>7} {'Action':>20}")
+    print("-" * 55)
 
     for step in range(args.max_steps):
         action_raw, _ = model.predict(obs, deterministic=True)
         action_raw = np.clip(action_raw, -1.0, 1.0)
 
-        # Apply action to laparoscope
-        scaled = action_raw * args.action_strength
-        action_tensor = torch.tensor(scaled, dtype=torch.float32, device=device)
-        simModel.applyCartesianActions(wp.from_torch(action_tensor))
+        # 2D action -> 3D (XZ plane, Y=0)
+        dx = action_raw[0] * args.action_strength
+        dz = action_raw[1] * args.action_strength
+        action_3d = torch.tensor([dx, 0.0, dz], dtype=torch.float32, device=device)
+        simModel.applyCartesianActions(wp.from_torch(action_3d))
 
-        # Update push tip position
+        # Update push tip (lock Y)
         lp = simModel.getLaparoscopePositionsTensor()
-        tip_torch = lp[0].cpu().numpy()
-        tip_pos = tip_torch.copy()
+        tip_actual = lp[0].cpu().numpy()
+        tip_pos[0] = tip_actual[0]
+        tip_pos[1] = tip_y  # locked
+        tip_pos[2] = tip_actual[2]
         simModel.pushTipPos = wp.array(
             [wp.vec3(tip_pos[0], tip_pos[1], tip_pos[2])],
             dtype=wp.vec3, device=device)
@@ -252,7 +264,6 @@ def main():
         simModel.resetCollisionInfo()
         simIntegrator.stepModel(simModel)
 
-        # Get new state
         obs = get_obs()
         broken_now = total_bonds - int(np.sum(simModel.rigidAdhesionActive.numpy() > 0.5))
         new_breaks = broken_now - prev_broken
@@ -260,8 +271,8 @@ def main():
         prev_broken = broken_now
 
         if step % 10 == 0 or step == args.max_steps - 1 or break_ratio >= 0.6:
-            action_str = f"[{action_raw[0]:+.3f}, {action_raw[1]:+.3f}, {action_raw[2]:+.3f}]"
-            print(f"{step:5d} {broken_now:8d} {break_ratio*100:6.1f}% {new_breaks:7d} {obs[6]:+10.3f} {action_str}")
+            action_str = f"[{action_raw[0]:+.3f}, {action_raw[1]:+.3f}]"
+            print(f"{step:5d} {broken_now:8d} {break_ratio*100:6.1f}% {new_breaks:7d} {action_str}")
 
         # Render
         simBVH.refitBVH()
@@ -271,7 +282,7 @@ def main():
             frames.append(frame)
 
         if break_ratio >= 0.6:
-            print(f"\n*** SUCCESS! Reached {break_ratio*100:.1f}% breakage at step {step} ***")
+            print(f"\n*** SUCCESS at step {step}! ***")
             for _ in range(10):
                 simBVH.refitBVH()
                 img_tensor = renderer.render(simBVH, simModel)
@@ -280,25 +291,22 @@ def main():
                     frames.append(frame)
             break
 
-    print(f"\nFinal breakage: {broken_now}/{total_bonds} ({break_ratio*100:.1f}%)")
-    print(f"Frames rendered: {len(frames)}")
+    print(f"\nFinal: {broken_now}/{total_bonds} ({break_ratio*100:.1f}%)")
+    print(f"Frames: {len(frames)}")
 
-    # --- Save video ---
     if frames:
         try:
             import imageio
-            print(f"\nSaving video to {args.output}...")
             writer = imageio.get_writer(args.output, fps=args.fps)
             for frame in frames:
                 writer.append_data(frame)
             writer.close()
-            print(f"Video saved: {args.output} ({len(frames)} frames)")
+            print(f"Video saved: {args.output}")
         except ImportError:
             os.makedirs("dissection_frames", exist_ok=True)
             from PIL import Image
             for i, frame in enumerate(frames):
                 Image.fromarray(frame).save(f"dissection_frames/frame_{i:04d}.png")
-            print(f"Saved {len(frames)} frames to dissection_frames/")
 
 
 if __name__ == "__main__":

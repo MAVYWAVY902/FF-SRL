@@ -560,11 +560,13 @@ def pushConstraintsDO(predictedVertex: wp.array(dtype=wp.vec3),
                       tipPos: wp.array(dtype=wp.vec3),
                       pushRadius: float,
                       pushStrength: float):
-    """Push free vertices away from dissector tip position.
+    """Push free vertices UPWARD (away from bone) near dissector tip.
 
-    Vertices within pushRadius are displaced radially outward from the tip.
-    Force has linear falloff: strongest at tip, zero at pushRadius boundary.
-    Only affects free vertices (inverseMass > 0).
+    Simulates a dissector wedging between tumor and bone:
+    - Only pushes vertices that are above or at the tip height (tumor side)
+    - Push direction is primarily upward (+Y) with a small radial XZ component
+    - Linear falloff from tip center to pushRadius boundary
+    - Only affects free vertices (inverseMass > 0)
     """
     tid = wp.tid()
 
@@ -574,14 +576,30 @@ def pushConstraintsDO(predictedVertex: wp.array(dtype=wp.vec3),
     pos = predictedVertex[tid]
     tip = tipPos[0]
     diff = pos - tip
-    dist = wp.length(diff)
 
-    if dist < FLOAT_EPSILON or dist > pushRadius:
+    # Only push vertices that are above or near the tip (tumor side, not bone side)
+    if diff[1] < -0.05:
         return
 
-    # Linear falloff: full strength at tip, zero at pushRadius
-    falloff = 1.0 - dist / pushRadius
-    direction = wp.normalize(diff)
+    # Use XZ distance for radius check (cylindrical influence zone)
+    xz_dist = wp.sqrt(diff[0] * diff[0] + diff[2] * diff[2])
+    y_dist = wp.abs(diff[1])
+    dist_3d = wp.length(diff)
+
+    if dist_3d < FLOAT_EPSILON or xz_dist > pushRadius:
+        return
+
+    # Linear falloff based on XZ distance
+    falloff = 1.0 - xz_dist / pushRadius
+
+    # Primary push direction: upward (+Y), lifting tumor off bone
+    # Small radial XZ component to spread tissue sideways
+    xz_len = wp.max(xz_dist, FLOAT_EPSILON)
+    radial_xz = wp.vec3(diff[0] / xz_len, 0.0, diff[2] / xz_len)
+    up = wp.vec3(0.0, 1.0, 0.0)
+
+    # 80% upward + 20% radial spread
+    direction = up * 0.8 + radial_xz * 0.2
     displacement = direction * pushStrength * falloff
 
     wp.atomic_add(dP, tid, displacement)
